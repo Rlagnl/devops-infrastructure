@@ -125,6 +125,8 @@ step_4_install_git() {
 
 # ============ 5. 克隆项目 ============
 step_5_clone_project() {
+    # 兼容目录不存在的情况: 先创建再进入(-p 已存在时不报错)
+    mkdir -p /root/workspace
     cd /root/workspace
     # 凭证优先使用环境变量; 若未设置则在此交互式输入(token 用 -s 静默输入, 不回显)
     # 注意: read 从 stdin(终端键盘)读取, 不受 run_step 里 tee 重定向影响
