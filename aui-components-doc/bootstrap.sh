@@ -105,9 +105,9 @@ step_1_install_nvm() {
 
 # ============ 2. 安装 Node LTS ============
 step_2_install_node() {
-    nvm install --lts
-    nvm use --lts
-    nvm alias default lts/*
+    nvm install 22
+    nvm use 22
+    nvm alias default 22
 }
 
 # ============ 3. 切换 npm 源到淘宝镜像 ============
