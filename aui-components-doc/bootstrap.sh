@@ -59,6 +59,104 @@ on_error() {
 }
 trap on_error ERR
 
+# ============ gum 自动检测 + 静默回退 ============
+# 设计目标: 在「系统已装 gum」→「下载静态 gum」→「回退到 read」三级中自动降级,
+# 任何环节失败都不影响脚本继续运行, 只是交互体验从 TUI 退化为普通 read.
+GUM_BIN=""
+
+ensure_gum() {
+    # 1) 系统已安装: 直接复用 PATH 中的 gum
+    if command -v gum >/dev/null 2>&1; then
+        GUM_BIN="$(command -v gum)"
+        return 0
+    fi
+    # 2) 之前下载过的临时副本(同一台机器重复执行时省一次下载)
+    local tmp_gum="/tmp/gum-bootstrap/gum"
+    if [[ -x "$tmp_gum" ]]; then
+        GUM_BIN="$tmp_gum"
+        return 0
+    fi
+    # 3) 自动下载静态二进制
+    #    - 锁定版本避免上游破坏性变更; 失败则静默回退到 read
+    #    - 仅支持 Linux x86_64/arm64 (本脚本本就要求 root + Linux 部署环境)
+    local arch os version
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64)        arch="x86_64" ;;
+        aarch64|arm64) arch="arm64"  ;;
+        *)  # 不支持的架构(如 mips/ppc): 静默走回退, 不报错
+            return 0 ;;
+    esac
+    os="Linux"
+    version="0.14.5"   # 如需升级, 修改此处即可
+    local url="https://github.com/charmbracelet/gum/releases/download/v${version}/gum_${version}_${os}_${arch}.tar.gz"
+    local tmp_dir="/tmp/gum-bootstrap"
+    mkdir -p "$tmp_dir"
+    # 用 && 链式判断, 任一步失败都跳到末尾 return 0, 让外层走回退分支
+    if curl -fsSL "$url" -o "$tmp_dir/gum.tar.gz" 2>/dev/null \
+        && tar -xzf "$tmp_dir/gum.tar.gz" -C "$tmp_dir" 2>/dev/null; then
+        # tar 包内二进制路径可能是 ./gum 或 gum_Linux_x86_64/gum, 两种都试
+        local extracted_bin=""
+        for candidate in "$tmp_dir/gum" "$tmp_dir/gum_${os}_${arch}/gum"; do
+            if [[ -f "$candidate" ]]; then
+                extracted_bin="$candidate"
+                break
+            fi
+        done
+        if [[ -n "${extracted_bin:-}" ]]; then
+            chmod +x "$extracted_bin"
+            GUM_BIN="$extracted_bin"
+            return 0
+        fi
+    fi
+    # 4) 下载/解压失败: GUM_BIN 保持空字符串, 由 prompt_* 函数走 read 回退
+    return 0
+}
+
+# 通用文本输入: 优先 gum input, 失败回退到 read </dev/tty
+# 用法: GIT_USER="$(prompt_input "请输入 GitHub 用户名:")"
+prompt_input() {
+    local prompt="$1"
+    local value
+    if [[ -n "$GUM_BIN" ]]; then
+        # 关键: gum 的 TUI 走 stderr, 必须显式重定向到 /dev/tty,
+        # 否则在 run_step 的 `> >(tee) 2>&1` 包裹下, stderr 是 pipe 而非 tty,
+        # gum 会判定非交互终端而拒绝渲染或直接退出.
+        # stdout 仍走命令替换被捕获, 用来取回用户输入的 value.
+        if value="$("$GUM_BIN" input --header "$prompt" --prompt "> " --width 50 \
+                        </dev/tty 2>/dev/tty)"; then
+            printf '%s' "$value"
+            return 0
+        fi
+    fi
+    # 回退: 普通交互输入. read -p 提示走 stderr, 会随 run_step 的 tee 显示到终端
+    read -r -p "$prompt" value </dev/tty
+    printf '%s' "$value"
+}
+
+# 密码输入: 优先 gum input --password, 失败回退到 read -s </dev/tty
+# 用法: GIT_TOKEN="$(prompt_password "请输入 GitHub Token:")"
+prompt_password() {
+    local prompt="$1"
+    local value
+    if [[ -n "$GUM_BIN" ]]; then
+        if value="$("$GUM_BIN" input --password --header "$prompt" --prompt "> " --width 50 \
+                        </dev/tty 2>/dev/tty)"; then
+            printf '%s' "$value"
+            return 0
+        fi
+    fi
+    # 回退: -s 静默模式不回显, 防止 token 明文出现在屏幕/日志
+    read -rs -p "$prompt" value </dev/tty
+    # -s 不会在回车后换行, 这里补一个换行让光标移到下一行.
+    # 必须写到 /dev/tty, 不能用普通 echo, 否则换行会被 $(...) 捕获进 value.
+    echo > /dev/tty
+    printf '%s' "$value"
+}
+
+# 在 trap 安装后尽早探测 gum, 让后续所有 prompt_* 都能直接使用 GUM_BIN
+ensure_gum
+
 # ============ 步骤执行器 ============
 # 用法: run_step "步骤描述" step_function_name
 run_step() {
@@ -128,23 +226,20 @@ step_5_clone_project() {
     # 兼容目录不存在的情况: 先创建再进入(-p 已存在时不报错)
     mkdir -p /root/workspace
     cd /root/workspace
-    # 凭证优先使用环境变量; 若未设置则在此交互式输入(token 用 -s 静默输入, 不回显)
-    # 注意: read 从 stdin(终端键盘)读取, 不受 run_step 里 tee 重定向影响
-    # 先初始化为空, 避免下方 while 在 set -u 下引用未定义变量报错
-    GIT_USER="${GIT_USER:-}"
-    GIT_TOKEN="${GIT_TOKEN:-}"
-    if [[ -z "$GIT_USER" ]]; then
-        while [[ -z "$GIT_USER" ]]; do
-            read -r -p "请输入 GitHub 用户名: " GIT_USER
-        done
-    fi
-    if [[ -z "$GIT_TOKEN" ]]; then
-        while [[ -z "$GIT_TOKEN" ]]; do
-            # -s: 静默模式, 输入不回显, 防止 token 明文出现在屏幕/日志中
-            read -rs -p "请输入 GitHub Personal Access Token (输入不可见): " GIT_TOKEN
-            echo  # -s 不会在回车后换行, 这里补一个换行
-        done
-    fi
+    # 交互式输入凭证(总是提示输入, 不复用环境变量, 避免误用旧值导致鉴权失败)
+    # prompt_input/prompt_password 已封装好 gum 优先 + read 回退逻辑:
+    #   * gum 可用 -> 美观的 TUI 输入框
+    #   * gum 不可用 -> 自动回退到 read </dev/tty, 仍能在 `curl|bash` 管道场景下工作
+    while true; do
+        GIT_USER="$(prompt_input "请输入 GitHub 用户名:")"
+        [[ -n "$GIT_USER" ]] && break
+        echo "用户名不能为空, 请重新输入"
+    done
+    while true; do
+        GIT_TOKEN="$(prompt_password "请输入 GitHub Personal Access Token:")"
+        [[ -n "$GIT_TOKEN" ]] && break
+        echo "Token 不能为空, 请重新输入"
+    done
     REPO_URL="https://github.com/Rlagnl/ai-chat-demo-app.git"
     # 禁用 git 自身的交互提示, 避免凭证错误时卡死(凭证由 helper 提供)
     export GIT_TERMINAL_PROMPT=0
