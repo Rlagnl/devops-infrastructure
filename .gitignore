@@ -1,0 +1,110 @@
+# ============ 操作系统 ============
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# ============ 编辑器 / IDE ============
+# VSCode
+.vscode/
+!.vscode/settings.json.example
+
+# JetBrains（IntelliJ / PyCharm / GoLand 等）
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Sublime Text
+*.sublime-workspace
+
+# ============ Shell 脚本临时文件 ============
+*.log
+*.tmp
+*.bak
+*.old
+*.out
+*.err
+nohup.out
+shell-output.txt
+
+# ============ 敏感信息 / 凭证（关键） ============
+# 环境变量与密钥文件
+.env
+.env.*
+!.env.example
+*.secret
+*.key
+*.pem
+*.p12
+*.crt
+!*.crt.example
+
+# SSH / 凭证
+.ssh/
+id_rsa*
+id_ed25519*
+known_hosts
+credentials
+credentials.json
+
+# 配置文件实际内容（仅保留 .example 模板）
+configs/*.conf
+!configs/*.conf.example
+
+# ============ 运行时产物 ============
+# 缓存与临时目录
+.cache/
+tmp/
+temp/
+
+# Python（如有 Python 辅助脚本）
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node（如有 Node 辅助工具）
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ============ 构建与打包 ============
+dist/
+build/
+*.tar
+*.tar.gz
+*.zip
+
+# ============ Docker ============
+# 不忽略 Dockerfile，仅忽略本地 compose 覆盖文件
+docker-compose.override.yml
+*.local.yml
+
+# ============ 测试 / 覆盖率 ============
+coverage/
+.coverage
+htmlcov/
+.pytest_cache/
