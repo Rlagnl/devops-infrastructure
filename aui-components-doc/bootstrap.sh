@@ -92,8 +92,17 @@ ensure_gum() {
     local url="https://github.com/charmbracelet/gum/releases/download/v${version}/gum_${version}_${os}_${arch}.tar.gz"
     local tmp_dir="/tmp/gum-bootstrap"
     mkdir -p "$tmp_dir"
-    # 用 && 链式判断, 任一步失败都跳到末尾 return 0, 让外层走回退分支
-    if curl -fsSL "$url" -o "$tmp_dir/gum.tar.gz" 2>/dev/null \
+
+    # 必须打印提示: 否则国内服务器访问 GitHub releases 慢时, 脚本会静默 hang,
+    # 用户看到的是"一执行就卡住无输出", 误以为脚本挂死.
+    # 写到 /dev/tty 而非 stdout, 避免被外层管道/重定向吞掉.
+    printf '%s[gum]%s 未检测到 gum, 正在下载静态二进制 (最多 30s)...\n' "$YELLOW" "$NC" >/dev/tty
+
+    # 关键: 必须给 curl 设超时, 否则 TCP/TLS 阶段可能 hang 数分钟
+    #   --connect-timeout 10: TCP 连接 + TLS 握手上限 10s (国内 DNS 污染/丢包时快速失败)
+    #   --max-time 30:        整个下载上限 30s (大文件下载慢时快速放弃)
+    # 任一步失败都跳到末尾 return 0, 让 prompt_* 走 read 回退, 不影响主流程
+    if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$tmp_dir/gum.tar.gz" 2>/dev/null \
         && tar -xzf "$tmp_dir/gum.tar.gz" -C "$tmp_dir" 2>/dev/null; then
         # tar 包内二进制路径可能是 ./gum 或 gum_Linux_x86_64/gum, 两种都试
         local extracted_bin=""
@@ -106,10 +115,12 @@ ensure_gum() {
         if [[ -n "${extracted_bin:-}" ]]; then
             chmod +x "$extracted_bin"
             GUM_BIN="$extracted_bin"
+            printf '%s[gum]%s 下载成功, 将使用 TUI 交互模式\n' "$GREEN" "$NC" >/dev/tty
             return 0
         fi
     fi
     # 4) 下载/解压失败: GUM_BIN 保持空字符串, 由 prompt_* 函数走 read 回退
+    printf '%s[gum]%s 下载失败, 回退到普通 read 交互模式\n' "$YELLOW" "$NC" >/dev/tty
     return 0
 }
 
