@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# Docker 部署引导脚本: 安装 Docker, 创建 compose 配置, 拉取启动服务, 配置 nginx, 启动 Watchtower 自动更新
+# 参考 bootstrap.sh 的分步骤执行 + 错误处理 + gum 交互模式
+# GITHUB_USER / GITHUB_PAT 支持三种传入方式:
+#   1) 命令行参数: sudo ./docker_bootstrap.sh -u <user> -t <token>
+#   2) 环境变量:   sudo GITHUB_USER=... GITHUB_PAT=... ./docker_bootstrap.sh
+#   3) 交互式输入: 不传任何参数, 脚本运行后用 gum/read 提示输入
+
+set -euo pipefail  # 未定义变量报错, 管道失败传递, 命令失败由 ERR trap 统一处理并退出
+set -E             # errtrace: 让 ERR trap 传播进 step_* 函数内部
+
+# ============ 颜色定义(非交互终端自动关闭颜色) ============
+if [[ -t 1 ]]; then
+    GREEN=$'\033[0;32m'
+    RED=$'\033[0;31m'
+    YELLOW=$'\033[1;33m'
+    BLUE=$'\033[0;34m'
+    NC=$'\033[0m'
+else
+    GREEN='' RED='' YELLOW='' BLUE='' NC=''
+fi
+
+# ============ root 权限检查 ============
+# 脚本包含 apt/systemctl/docker 等操作, 必须以 root 身份运行
+if [[ $EUID -ne 0 ]]; then
+    printf '%s错误: 本脚本必须以 root 权限执行。%s\n' "$RED" "$NC" >&2
+    printf '请使用 sudo 重新运行, 例如:%s\n' "$NC" >&2
+    printf '  sudo %s%s%s\n' "$0" "${*:+ }" "$*" >&2
+    exit 1
+fi
+
+# 保存原始 stdout/stderr 到 fd 3/4, 供 on_error 绕过 run_step 里的 tee 直接写终端
+exec 3>&1 4>&2
+
+# ============ 步骤状态上下文 ============
+STEP_NUM=0        # 当前步骤序号
+STEP_DESC=""      # 当前步骤描述
+STEP_LOG=""       # 当前步骤输出日志临时文件路径(用于失败时提取错误信息)
+
+# ============ 错误处理: 任意命令失败时触发 ============
+on_error() {
+    local code=$?
+    # 仅在有步骤上下文时打印, 避免脚本启动前的意外错误也走这里
+    if [[ -n "$STEP_DESC" ]]; then
+        # 绕过 run_step 里的 tee 重定向, 直接写原始终端, 避免污染 $STEP_LOG
+        exec 1>&3 2>&4
+        printf '\n%s========================================%s\n' "$RED" "$NC"
+        printf '%s[失败] 步骤 %s: %s (退出码: %s)%s\n' "$RED" "$STEP_NUM" "$STEP_DESC" "$code" "$NC"
+        # 等待 tee 刷新缓冲, 然后提取最近输出作为错误信息
+        if [[ -n "$STEP_LOG" && -f "$STEP_LOG" ]]; then
+            sleep 0.1
+            printf '%s最近输出(错误信息):%s\n' "$RED" "$NC"
+            tail -n 20 "$STEP_LOG" | sed 's/^/    /'
+        fi
+        printf '%s========================================%s\n' "$RED" "$NC"
+        printf '%s脚本因步骤 %s 失败而终止。%s\n' "$RED" "$STEP_NUM" "$NC"
+    fi
+    # 清理临时日志
+    [[ -n "$STEP_LOG" && -f "$STEP_LOG" ]] && rm -f "$STEP_LOG"
+    exit "$code"
+}
+trap on_error ERR
+
+# ============ gum 自动检测 + 静默回退 ============
+# 设计目标: 在「系统已装 gum」→「apt 安装 gum」→「回退到 read」三级中自动降级,
+# 任何环节失败都不影响脚本继续运行, 只是交互体验从 TUI 退化为普通 read.
+GUM_BIN=""
+
+ensure_gum() {
+    # 1) 系统已安装: 直接复用 PATH 中的 gum
+    if command -v gum >/dev/null 2>&1; then
+        GUM_BIN="$(command -v gum)"
+        return 0
+    fi
+
+    # 2) 通过 apt 安装 (稳定优先, 版本旧一点可接受)
+    printf '%s[gum]%s 未检测到 gum, 尝试通过 apt 安装...\n' "$YELLOW" "$NC" >/dev/tty
+
+    # 避免 apt 交互式提示卡住脚本
+    export DEBIAN_FRONTEND=noninteractive
+    local apt_log
+    apt_log="$(mktemp)"
+
+    if apt-get update -qq >"$apt_log" 2>&1 \
+        && apt-get install -y -qq gum >>"$apt_log" 2>&1; then
+        # 验证安装真的成功
+        if command -v gum >/dev/null 2>&1; then
+            GUM_BIN="$(command -v gum)"
+            printf '%s[gum]%s 安装成功, 将使用 TUI 交互模式\n' "$GREEN" "$NC" >/dev/tty
+            rm -f "$apt_log"
+            return 0
+        fi
+    fi
+
+    # 3) apt 失败: 打印日志末尾帮助诊断, 回退到 read (不影响主流程)
+    printf '%s[gum]%s apt 安装失败, 回退到普通 read 交互模式\n' "$YELLOW" "$NC" >/dev/tty
+    if [[ -s "$apt_log" ]]; then
+        printf '%s[gum]%s apt 日志(最后 10 行):\n%s\n' "$YELLOW" "$NC" \
+            "$(tail -n 10 "$apt_log")" >/dev/tty
+    fi
+    rm -f "$apt_log"
+    return 0
+}
+
+# 通用文本输入: 优先 gum input, 失败回退到 read </dev/tty
+prompt_input() {
+    local prompt="$1"
+    local value
+    if [[ -n "$GUM_BIN" ]]; then
+        # gum 的 TUI 走 stderr, 必须显式重定向到 /dev/tty, 否则在 run_step 的 tee 包裹下会拒绝渲染
+        if value="$("$GUM_BIN" input --header "$prompt" --prompt "> " --width 50 \
+                        </dev/tty 2>/dev/tty)"; then
+            printf '%s' "$value"
+            return 0
+        fi
+    fi
+    read -r -p "$prompt" value </dev/tty
+    printf '%s' "$value"
+}
+
+# 密码输入: 优先 gum input --password, 失败回退到 read -s </dev/tty
+prompt_password() {
+    local prompt="$1"
+    local value
+    if [[ -n "$GUM_BIN" ]]; then
+        if value="$("$GUM_BIN" input --password --header "$prompt" --prompt "> " --width 50 \
+                        </dev/tty 2>/dev/tty)"; then
+            printf '%s' "$value"
+            return 0
+        fi
+    fi
+    # -s 静默模式不回显, 防止 token 明文出现在屏幕/日志
+    read -rs -p "$prompt" value </dev/tty
+    # -s 不会在回车后换行, 补一个换行到 /dev/tty (不能用 echo, 会被 $(...) 捕获)
+    echo > /dev/tty
+    printf '%s' "$value"
+}
+
+# ============ 参数解析 ============
+# 先读取环境变量作为默认值, 再用命令行参数覆盖, 最后缺失项交由交互式输入补全
+GITHUB_USER="${GITHUB_USER:-}"
+GITHUB_PAT="${GITHUB_PAT:-}"
+
+usage() {
+    cat >&2 <<EOF
+用法: sudo $0 [-u GitHub用户名] [-t GitHubToken]
+  -u  GitHub 用户名 (也可用环境变量 GITHUB_USER 或交互输入)
+  -t  GitHub Personal Access Token (需 write:packages + read:packages 权限)
+  -h  显示帮助
+EOF
+    exit 1
+}
+
+while getopts "u:t:h" opt; do
+    case "$opt" in
+        u) GITHUB_USER="$OPTARG" ;;
+        t) GITHUB_PAT="$OPTARG" ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+# 在 trap 安装后尽早探测 gum, 让后续 prompt_* 都能直接使用 GUM_BIN
+ensure_gum
+
+# ============ 步骤执行器 ============
+# 用法: run_step "步骤描述" step_function_name
+run_step() {
+    local desc="$1"
+    local func="$2"
+    STEP_NUM=$((STEP_NUM + 1))
+    STEP_DESC="$desc"
+    STEP_LOG="$(mktemp)"
+
+    # —— 执行前 ——
+    printf '\n%s========================================%s\n' "$BLUE" "$NC"
+    printf '%s步骤 %s: %s%s\n' "$BLUE" "$STEP_NUM" "$desc" "$NC"
+    printf '%s[状态] 开始执行...%s\n' "$YELLOW" "$NC"
+    printf '%s----------------------------------------%s\n' "$BLUE" "$NC"
+
+    local start_time=$SECONDS
+
+    # —— 执行中 ——
+    # 进程替换不会为函数创建子 shell, 因此 cd/export 等副作用会保留到后续步骤
+    "$func" > >(tee "$STEP_LOG") 2>&1
+
+    local duration=$((SECONDS - start_time))
+    sleep 0.1
+
+    # —— 执行后(成功) ——
+    printf '%s----------------------------------------%s\n' "$GREEN" "$NC"
+    printf '%s[状态] 步骤 %s [成功] - %s (耗时 %ss)%s\n' "$GREEN" "$STEP_NUM" "$desc" "$duration" "$NC"
+
+    rm -f "$STEP_LOG"
+    STEP_DESC=""
+}
+
+# ============ 0. 收集 GitHub 凭证 ============
+step_0_collect_credentials() {
+    # 命令行/环境变量已提供则跳过交互, 否则提示输入
+    if [[ -z "$GITHUB_USER" ]]; then
+        while true; do
+            GITHUB_USER="$(prompt_input "请输入 GitHub 用户名:")"
+            [[ -n "$GITHUB_USER" ]] && break
+            echo "用户名不能为空, 请重新输入"
+        done
+    else
+        echo "已通过参数/环境变量获取 GitHub 用户名: $GITHUB_USER"
+    fi
+
+    if [[ -z "$GITHUB_PAT" ]]; then
+        while true; do
+            GITHUB_PAT="$(prompt_password "请输入 GitHub Personal Access Token:")"
+            [[ -n "$GITHUB_PAT" ]] && break
+            echo "Token 不能为空, 请重新输入"
+        done
+    else
+        echo "已通过参数/环境变量获取 GitHub Token (隐藏显示)"
+    fi
+}
+
+# ============ 1. 安装 Docker ============
+step_1_install_docker() {
+    # 幂等: 已安装则跳过
+    if command -v docker >/dev/null 2>&1; then
+        echo "Docker 已安装, 跳过安装步骤"
+    else
+        # Aliyun 镜像源加速, 国内服务器拉取 docker-ce 更稳定
+        curl -fsSL https://get.docker.com | bash -s docker --mirror Aliyun
+    fi
+    systemctl enable docker
+    systemctl start docker
+}
+
+# ============ 2. 创建 compose 配置 ============
+step_2_create_compose() {
+    mkdir -p /opt/aui-components-doc
+    cd /opt/aui-components-doc
+    # EOF 不加引号: ${GITHUB_USER} 需要被 shell 展开写入镜像地址
+    cat > docker-compose.yml << EOF
+services:
+  aui-docs:
+    image: ghcr.io/${GITHUB_USER}/aui-components-doc:latest
+    container_name: aui-components-doc
+    ports:
+      - "127.0.0.1:3000:80"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+EOF
+    echo "docker-compose.yml 已生成:"
+    cat docker-compose.yml
+}
+
+# ============ 3. 登录 ghcr.io 并拉取启动服务 ============
+step_3_login_and_start() {
+    cd /opt/aui-components-doc
+    # password-stdin: 避免 token 出现在命令行参数/进程列表(/proc/<pid>/cmdline)中
+    echo "$GITHUB_PAT" | docker login ghcr.io -u "$GITHUB_USER" --password-stdin
+    docker compose pull
+    docker compose up -d
+}
+
+# ============ 4. 配置 nginx 反向代理 ============
+step_4_setup_nginx() {
+    # 幂等: 未安装才安装
+    if ! command -v nginx >/dev/null 2>&1; then
+        apt-get update -qq
+        apt-get install -y -qq nginx
+    fi
+    systemctl enable nginx
+    systemctl start nginx
+
+    # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开
+    tee /etc/nginx/sites-available/aui-components-doc > /dev/null <<'NGINX'
+server {
+    listen 80;
+    server_name _;
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # WebSocket 支持
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+NGINX
+    # 移除默认站点避免 80 端口冲突
+    rm -f /etc/nginx/sites-enabled/default
+    ln -sf /etc/nginx/sites-available/aui-components-doc /etc/nginx/sites-enabled/aui-components-doc
+    # 测试配置语法, 出错就退出不 reload
+    nginx -t
+    systemctl reload nginx
+}
+
+# ============ 5. 启动 Watchtower 自动更新 ============
+step_5_start_watchtower() {
+    # 已存在则先移除, 支持脚本重复执行
+    if docker ps -a --format '{{.Names}}' | grep -q '^watchtower$'; then
+        echo "watchtower 容器已存在, 移除旧容器后重建"
+        docker rm -f watchtower
+    fi
+    docker run -d \
+        --name watchtower \
+        --restart unless-stopped \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -e REPO_USER="$GITHUB_USER" \
+        -e REPO_PASS="$GITHUB_PAT" \
+        containerrr/watchtower \
+        --interval 30 \
+        --cleanup \
+        aui-components-doc
+}
+
+# ============ 6. 验证部署 ============
+step_6_verify() {
+    # 容器刚启动需要短暂时间进入 ready 状态
+    sleep 2
+    local internal_code ext_code
+    # || echo "000" 兜底: 连接失败时 curl 返回非 0, 用 000 表示不可达, 不触发 set -e
+    internal_code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000 || echo "000")"
+    ext_code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1 || echo "000")"
+    echo "容器内部响应(127.0.0.1:3000): $internal_code"
+    echo "nginx 转发响应(127.0.0.1:80):   $ext_code"
+    if [[ "$internal_code" != "200" && "$ext_code" != "200" ]]; then
+        echo "警告: 服务未正常响应, 请检查容器日志: docker logs aui-components-doc"
+    fi
+}
+
+# ============ 执行所有步骤 ============
+run_step "收集 GitHub 凭证"          step_0_collect_credentials
+run_step "安装 Docker"               step_1_install_docker
+run_step "创建 compose 配置"         step_2_create_compose
+run_step "登录 ghcr.io 并启动服务"   step_3_login_and_start
+run_step "配置 nginx 反向代理"        step_4_setup_nginx
+run_step "启动 Watchtower 自动更新"  step_5_start_watchtower
+run_step "验证部署"                  step_6_verify
+
+SERVER_IP="$(curl -s ifconfig.me 2>/dev/null || echo "<服务器IP>")"
+printf '\n%s========================================%s\n' "$GREEN" "$NC"
+printf '%s所有步骤执行完成! 服务已部署成功。%s\n' "$GREEN" "$NC"
+printf '访问地址: http://%s\n' "$SERVER_IP"
+printf '项目目录: /opt/aui-components-doc\n'
+printf 'Watchtower 每 30 秒检查一次镜像更新并自动部署\n'
+printf '%s========================================%s\n' "$GREEN" "$NC"

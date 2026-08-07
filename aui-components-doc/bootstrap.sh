@@ -208,6 +208,12 @@ step_3_switch_npm_registry() {
     npm install -g nrm
     nrm use taobao
     npm install -g pm2
+    # nvm 管理的 node/npm/pm2 只在 nvm 的 PATH 里(/root/.nvm/versions/node/v22.x/bin/),
+    # 用户登录的新 shell 不会自动加载 nvm, 导致手动执行 pm2 报 "command not found".
+    # 创建 symlink 到 /usr/local/bin(系统默认 PATH), 让所有用户和重启后的 systemd 都能用.
+    ln -sf "$(which node)" /usr/local/bin/node
+    ln -sf "$(which npm)"  /usr/local/bin/npm
+    ln -sf "$(which pm2)"  /usr/local/bin/pm2
 }
 
 # ============ 4. 安装 git ============
@@ -339,7 +345,7 @@ step_10_install_nginx() {
 server {
     listen 80;
 
-    server_name_;
+    server_name _;
 
     location / {
         proxy_pass http://127.0.0.1:3000;
