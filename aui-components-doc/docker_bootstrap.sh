@@ -237,10 +237,12 @@ step_2_create_compose() {
     mkdir -p /opt/aui-components-doc
     cd /opt/aui-components-doc
     # EOF 不加引号: ${GITHUB_USER} 需要被 shell 展开写入镜像地址
+    # ${GITHUB_USER,,} 仅在此处把用户名转小写: ghcr.io 镜像路径不允许大写字母
+    # (docker login / watchtower 的 REPO_USER 仍用原始大小写, GitHub 鉴权大小写无关)
     cat > docker-compose.yml << EOF
 services:
   aui-docs:
-    image: ghcr.io/${GITHUB_USER}/aui-components-doc:latest
+    image: ghcr.io/${GITHUB_USER,,}/aui-components-doc:latest
     container_name: aui-components-doc
     ports:
       - "127.0.0.1:3000:80"
