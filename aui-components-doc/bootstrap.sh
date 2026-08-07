@@ -60,7 +60,7 @@ on_error() {
 trap on_error ERR
 
 # ============ gum 自动检测 + 静默回退 ============
-# 设计目标: 在「系统已装 gum」→「下载静态 gum」→「回退到 read」三级中自动降级,
+# 设计目标: 在「系统已装 gum」→「apt 安装 gum」→「回退到 read」三级中自动降级,
 # 任何环节失败都不影响脚本继续运行, 只是交互体验从 TUI 退化为普通 read.
 GUM_BIN=""
 
@@ -70,57 +70,41 @@ ensure_gum() {
         GUM_BIN="$(command -v gum)"
         return 0
     fi
-    # 2) 之前下载过的临时副本(同一台机器重复执行时省一次下载)
-    local tmp_gum="/tmp/gum-bootstrap/gum"
-    if [[ -x "$tmp_gum" ]]; then
-        GUM_BIN="$tmp_gum"
-        return 0
-    fi
-    # 3) 自动下载静态二进制
-    #    - 锁定版本避免上游破坏性变更; 失败则静默回退到 read
-    #    - 仅支持 Linux x86_64/arm64 (本脚本本就要求 root + Linux 部署环境)
-    local arch os version
-    arch="$(uname -m)"
-    case "$arch" in
-        x86_64)        arch="x86_64" ;;
-        aarch64|arm64) arch="arm64"  ;;
-        *)  # 不支持的架构(如 mips/ppc): 静默走回退, 不报错
-            return 0 ;;
-    esac
-    os="Linux"
-    version="0.14.5"   # 如需升级, 修改此处即可
-    local url="https://github.com/charmbracelet/gum/releases/download/v${version}/gum_${version}_${os}_${arch}.tar.gz"
-    local tmp_dir="/tmp/gum-bootstrap"
-    mkdir -p "$tmp_dir"
 
-    # 必须打印提示: 否则国内服务器访问 GitHub releases 慢时, 脚本会静默 hang,
-    # 用户看到的是"一执行就卡住无输出", 误以为脚本挂死.
-    # 写到 /dev/tty 而非 stdout, 避免被外层管道/重定向吞掉.
-    printf '%s[gum]%s 未检测到 gum, 正在下载静态二进制 (最多 30s)...\n' "$YELLOW" "$NC" >/dev/tty
+    # 2) 通过 apt 安装 (稳定优先, 版本旧一点可接受)
+    #    Ubuntu 24.04+ / Debian 13+ 官方仓库已包含 gum;
+    #    旧系统(如 Ubuntu 22.04)仓库没有 gum 包, 安装会失败, 自动回退到 read.
+    #    相比下载静态二进制: apt 走系统源(国内服务器配了阿里云/清华源就很快),
+    #    无需依赖 GitHub/代理, 稳定性高一个数量级.
+    printf '%s[gum]%s 未检测到 gum, 尝试通过 apt 安装...\n' "$YELLOW" "$NC" >/dev/tty
 
-    # 关键: 必须给 curl 设超时, 否则 TCP/TLS 阶段可能 hang 数分钟
-    #   --connect-timeout 10: TCP 连接 + TLS 握手上限 10s (国内 DNS 污染/丢包时快速失败)
-    #   --max-time 30:        整个下载上限 30s (大文件下载慢时快速放弃)
-    # 任一步失败都跳到末尾 return 0, 让 prompt_* 走 read 回退, 不影响主流程
-    if curl -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$tmp_dir/gum.tar.gz" 2>/dev/null \
-        && tar -xzf "$tmp_dir/gum.tar.gz" -C "$tmp_dir" 2>/dev/null; then
-        # tar 包内二进制路径可能是 ./gum 或 gum_Linux_x86_64/gum, 两种都试
-        local extracted_bin=""
-        for candidate in "$tmp_dir/gum" "$tmp_dir/gum_${os}_${arch}/gum"; do
-            if [[ -f "$candidate" ]]; then
-                extracted_bin="$candidate"
-                break
-            fi
-        done
-        if [[ -n "${extracted_bin:-}" ]]; then
-            chmod +x "$extracted_bin"
-            GUM_BIN="$extracted_bin"
-            printf '%s[gum]%s 下载成功, 将使用 TUI 交互模式\n' "$GREEN" "$NC" >/dev/tty
+    # 避免 apt 交互式提示卡住脚本 (如 tzdata 配置弹窗等待输入)
+    export DEBIAN_FRONTEND=noninteractive
+    # apt 输出量大(几百行), 重定向到临时日志, 失败时打印末尾辅助诊断
+    local apt_log
+    apt_log="$(mktemp)"
+
+    # apt-get update: 刷新包索引, 避免过期索引导致安装失败
+    # apt-get install: -y 自动 yes, -qq 静默模式减少输出
+    # 两条命令用 && 链接放 if 条件里, 失败不会触发 set -e, 直接走回退分支
+    if apt-get update -qq >"$apt_log" 2>&1 \
+        && apt-get install -y -qq gum >>"$apt_log" 2>&1; then
+        # 验证安装真的成功: 极少数情况 apt 返回 0 但实际没装上(如包名错误)
+        if command -v gum >/dev/null 2>&1; then
+            GUM_BIN="$(command -v gum)"
+            printf '%s[gum]%s 安装成功, 将使用 TUI 交互模式\n' "$GREEN" "$NC" >/dev/tty
+            rm -f "$apt_log"
             return 0
         fi
     fi
-    # 4) 下载/解压失败: GUM_BIN 保持空字符串, 由 prompt_* 函数走 read 回退
-    printf '%s[gum]%s 下载失败, 回退到普通 read 交互模式\n' "$YELLOW" "$NC" >/dev/tty
+
+    # 3) apt 失败: 打印日志末尾帮助诊断, 回退到 read (不影响主流程)
+    printf '%s[gum]%s apt 安装失败, 回退到普通 read 交互模式\n' "$YELLOW" "$NC" >/dev/tty
+    if [[ -s "$apt_log" ]]; then
+        printf '%s[gum]%s apt 日志(最后 10 行):\n%s\n' "$YELLOW" "$NC" \
+            "$(tail -n 10 "$apt_log")" >/dev/tty
+    fi
+    rm -f "$apt_log"
     return 0
 }
 
@@ -265,7 +249,7 @@ step_6_install_deps() {
     cd ai-chat-demo-app
     corepack enable
     pnpm install
-    pnpm turbo build filter=aui-components-doc
+    pnpm turbo run build --filter=aui-components-doc
 }
 
 # ============ 7. 启动服务 ============
