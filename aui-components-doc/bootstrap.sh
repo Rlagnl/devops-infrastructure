@@ -244,30 +244,83 @@ step_5_clone_project() {
         clone "$REPO_URL"
 }
 
-# ============ 6. 安装依赖 ============
-step_6_install_deps() {
+# ============ 6. 确保 swap (build 前置) ============
+step_6_ensure_swap() {
+    # Next.js build 峰值内存 2-4GB, 1GB 内存的 VPS 不加 swap 会 OOM 卡死.
+    # 幂等: 已有足够 swap(>=1GB) 则跳过, 支持脚本重复执行.
+    local current_swap_kb
+    current_swap_kb="$(awk '/SwapTotal/ {print $2}' /proc/meminfo)"
+    # 1GB = 1048576 KB, 已有 >= 1GB swap 就不再创建
+    if [[ "${current_swap_kb:-0}" -ge 1048576 ]]; then
+        echo "已有 swap $((current_swap_kb / 1024)) MB, 跳过创建"
+        return 0
+    fi
+
+    echo "当前 swap $((current_swap_kb / 1024)) MB, 不足以支撑 Next.js build, 创建 2GB swap..."
+
+    local swap_file="/swapfile"
+
+    # 检查根分区剩余空间: 空间不足时 fallocate 会失败, dd 会写到磁盘满后卡死,
+    # 提前检查并显式失败, 让 on_error trap 清晰报告原因
+    local free_mb
+    free_mb="$(df -m / | awk 'NR==2 {print $4}')"
+    if [[ "${free_mb:-0}" -lt 2048 ]]; then
+        echo "错误: 根分区剩余空间仅 ${free_mb} MB, 需要 2048 MB, 无法创建 swap"
+        echo "请清理磁盘空间或手动配置 swap 后重试"
+        return 1
+    fi
+
+    # 创建 swap 文件: 优先 fallocate(瞬间完成), 某些文件系统(ZFS/Btrfs)不支持时 fallback 到 dd
+    if [[ -f "$swap_file" ]]; then
+        echo "swap 文件已存在但未启用, 重新格式化并启用"
+    else
+        if ! fallocate -l 2G "$swap_file" 2>/dev/null; then
+            echo "fallocate 不支持, 改用 dd 创建 (可能需要 1-2 分钟)..."
+            dd if=/dev/zero of="$swap_file" bs=1M count=2048 status=progress
+        fi
+    fi
+
+    chmod 600 "$swap_file"
+    mkswap "$swap_file" >/dev/null
+    swapon "$swap_file"
+
+    # 写入 fstab 持久化(重启后自动挂载), 检查避免重复写入
+    if ! grep -q "^${swap_file} " /etc/fstab; then
+        echo "${swap_file} none swap sw 0 0" >> /etc/fstab
+    fi
+
+    echo "swap 创建完成:"
+    free -h
+}
+
+# ============ 7. 安装依赖 ============
+step_7_install_deps() {
     cd ai-chat-demo-app
     corepack enable
     pnpm install
-    pnpm turbo run build --filter=aui-components-doc
+    # 注意 filter 语法: 必须是 --filter=<pkg>, 不能写成 filter=<pkg>.
+    # 错误写法 `filter=aui-components-doc` 缺少 -- 前缀, turbo 不会把它当 filter 选项,
+    # 而是当作第二个 task 名, 导致 --filter 失效, turbo 会构建 monorepo 里所有 package
+    # 的 build 任务(不只是 aui-components-doc), 其他 package 卡住时整体看起来像挂死.
+    pnpm turbo build --filter=aui-components-doc
 }
 
-# ============ 7. 启动服务 ============
-step_7_start_service() {
+# ============ 8. 启动服务 ============
+step_8_start_service() {
     cd apps/docs/aui-components-doc
     pm2 start pnpm --name aui-components-doc -- start
 }
 
-# ============ 8. 配置 pm2 开机自启 ============
-step_8_pm2_autostart() {
+# ============ 9. 配置 pm2 开机自启 ============
+step_9_pm2_autostart() {
     sudo env PATH=$PATH:$(dirname $(dirname $(which node))) \
          $(which pm2) startup systemd -u $USER --hp $HOME
     # 保存进程列表, 开机后自动恢复
     pm2 save
 }
 
-# ============ 9. 安装 nginx ============
-step_9_install_nginx() {
+# ============ 10. 安装 nginx ============
+step_10_install_nginx() {
     apt install nginx -y
     systemctl enable nginx
     systemctl start nginx
@@ -308,10 +361,11 @@ run_step "安装 Node LTS"             step_2_install_node
 run_step "切换 npm 源到淘宝镜像"      step_3_switch_npm_registry
 run_step "安装 git"                  step_4_install_git
 run_step "克隆项目"                  step_5_clone_project
-run_step "安装依赖"                  step_6_install_deps
-run_step "启动服务"                  step_7_start_service
-run_step "配置 pm2 开机自启"          step_8_pm2_autostart
-run_step "安装 nginx"                step_9_install_nginx
+run_step "确保 swap (build 前置)"    step_6_ensure_swap
+run_step "安装依赖"                  step_7_install_deps
+run_step "启动服务"                  step_8_start_service
+run_step "配置 pm2 开机自启"          step_9_pm2_autostart
+run_step "安装 nginx"                step_10_install_nginx
 
 printf '\n%s========================================%s\n' "$GREEN" "$NC"
 printf '%s所有步骤执行完成! 服务已部署成功。%s\n' "$GREEN" "$NC"
