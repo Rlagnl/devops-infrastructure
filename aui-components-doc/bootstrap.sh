@@ -256,7 +256,7 @@ step_6_ensure_swap() {
         return 0
     fi
 
-    echo "当前 swap $((current_swap_kb / 1024)) MB, 不足以支撑 Next.js build, 创建 2GB swap..."
+    echo "当前 swap $((current_swap_kb / 1024)) MB, 不足以支撑 Next.js build, 创建 4GB swap..."
 
     local swap_file="/swapfile"
 
@@ -264,8 +264,8 @@ step_6_ensure_swap() {
     # 提前检查并显式失败, 让 on_error trap 清晰报告原因
     local free_mb
     free_mb="$(df -m / | awk 'NR==2 {print $4}')"
-    if [[ "${free_mb:-0}" -lt 2048 ]]; then
-        echo "错误: 根分区剩余空间仅 ${free_mb} MB, 需要 2048 MB, 无法创建 swap"
+    if [[ "${free_mb:-0}" -lt 4096 ]]; then
+        echo "错误: 根分区剩余空间仅 ${free_mb} MB, 需要 4096 MB, 无法创建 swap"
         echo "请清理磁盘空间或手动配置 swap 后重试"
         return 1
     fi
@@ -274,15 +274,20 @@ step_6_ensure_swap() {
     if [[ -f "$swap_file" ]]; then
         echo "swap 文件已存在但未启用, 重新格式化并启用"
     else
-        if ! fallocate -l 2G "$swap_file" 2>/dev/null; then
-            echo "fallocate 不支持, 改用 dd 创建 (可能需要 1-2 分钟)..."
-            dd if=/dev/zero of="$swap_file" bs=1M count=2048 status=progress
+        if ! fallocate -l 4G "$swap_file" 2>/dev/null; then
+            echo "fallocate 不支持, 改用 dd 创建 (可能需要 3-5 分钟)..."
+            dd if=/dev/zero of="$swap_file" bs=1M count=4096 status=progress
         fi
     fi
 
     chmod 600 "$swap_file"
     mkswap "$swap_file" >/dev/null
     swapon "$swap_file"
+
+    # 确保 kernel 积极使用 swap: 某些云服务器(阿里云/腾讯云)默认 swappiness=1 或 0,
+    # 内核宁可 OOM kill 也不用 swap, 必须显式调到 60(默认值)才会在内存紧张时换页.
+    # 用 || true 避免 sysctl 失败影响主流程(swappiness 设置失败不影响 swap 本身生效)
+    sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
 
     # 写入 fstab 持久化(重启后自动挂载), 检查避免重复写入
     if ! grep -q "^${swap_file} " /etc/fstab; then
@@ -302,7 +307,11 @@ step_7_install_deps() {
     # 错误写法 `filter=aui-components-doc` 缺少 -- 前缀, turbo 不会把它当 filter 选项,
     # 而是当作第二个 task 名, 导致 --filter 失效, turbo 会构建 monorepo 里所有 package
     # 的 build 任务(不只是 aui-components-doc), 其他 package 卡住时整体看起来像挂死.
-    pnpm turbo build --filter=aui-components-doc
+    #
+    # --concurrency=1: 强制串行构建. --filter 会自动构建目标包的依赖包(meta/knowledge-builder),
+    # turbo 默认并行构建无依赖关系的包, 多个 node 进程同时跑导致内存叠加(峰值 4-8GB)触发 OOM.
+    # 串行构建时内存峰值 = 单个任务最大值(约 2-4GB), 1GB 内存 + 4GB swap = 5GB 够用.
+    pnpm turbo build --filter=aui-components-doc --concurrency=1
 }
 
 # ============ 8. 启动服务 ============
