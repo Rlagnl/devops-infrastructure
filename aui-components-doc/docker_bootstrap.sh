@@ -233,18 +233,21 @@ step_1_install_docker() {
 
     # 配置 Docker Hub 镜像加速器: 国内直连 registry-1.docker.io 会 i/o timeout,
     # 必须配置 registry-mirrors 才能拉取 watchtower 等位于 Docker Hub 的镜像.
-    # 2026 年实测可用的国内加速源(多源回退, 顺序即优先级):
-    #   docker.1ms.run        毫秒镜像
-    #   docker.m.daocloud.io  DaoCloud
-    #   docker.xuanyuan.me    轩辕镜像免费版
+    # 只放「全量代理」源, 不要放白名单源(如 docker.m.daocloud.io):
+    #   白名单源对非白名单镜像会返回 HTTP 错误, 而 Docker 遇到正常 HTTP 错误不会
+    #   回退到下一个 mirror, 导致 watchtower 这类非白名单镜像拉取直接失败.
+    # 2026 年实测可用的全量代理源(多源回退, 顺序即优先级):
+    #   docker.1ms.run       毫秒镜像
+    #   docker.xuanyuan.me   轩辕镜像免费版
+    #   docker.1panel.live   1Panel
     # 注: 此处覆盖 /etc/docker/daemon.json, 适用于全新部署的服务器.
     mkdir -p /etc/docker
     tee /etc/docker/daemon.json > /dev/null <<'EOF'
 {
     "registry-mirrors": [
         "https://docker.1ms.run",
-        "https://docker.m.daocloud.io",
-        "https://docker.xuanyuan.me"
+        "https://docker.xuanyuan.me",
+        "https://docker.1panel.live"
     ],
     "live-restore": true
 }
@@ -333,6 +336,40 @@ step_5_start_watchtower() {
         echo "watchtower 容器已存在, 移除旧容器后重建"
         docker rm -f watchtower
     fi
+
+    # watchtower 镜像在 Docker Hub, 国内需经镜像加速代理拉取.
+    # 不依赖 daemon.json 的 registry-mirrors 回退(Docker 遇 HTTP 错误不回退),
+    # 改用「显式前缀拉取 + 重打标签」: 依次尝试多个全量代理源, 成功一个就 retag 成标准名.
+    local watchtower_img="containerrr/watchtower:latest"
+    if ! docker image inspect "$watchtower_img" >/dev/null 2>&1; then
+        # 全量代理源(非白名单), 顺序即优先级. 1ms.run 最稳定放首位.
+        local mirrors=(
+            "docker.1ms.run"
+            "docker.xuanyuan.me"
+            "docker.1panel.live"
+            "dockerproxy.net"
+        )
+        local pulled=0
+        for m in "${mirrors[@]}"; do
+            echo "尝试从镜像源拉取 watchtower: $m/$watchtower_img"
+            # 放在 if 条件里: 失败不会触发 set -e, 继续尝试下一个源
+            if docker pull "$m/$watchtower_img"; then
+                # 重打标签成标准名, 让后续 docker run 用原始镜像名即可
+                docker tag "$m/$watchtower_img" "$watchtower_img"
+                # 移除带前缀的中间标签(底层镜像层因标准名仍被引用而保留)
+                docker rmi "$m/$watchtower_img" >/dev/null 2>&1 || true
+                pulled=1
+                break
+            fi
+        done
+        if [[ "$pulled" -eq 0 ]]; then
+            echo "错误: 所有镜像源均拉取 watchtower 失败"
+            return 1
+        fi
+    else
+        echo "watchtower 镜像已存在, 跳过拉取"
+    fi
+
     docker run -d \
         --name watchtower \
         --restart unless-stopped \
