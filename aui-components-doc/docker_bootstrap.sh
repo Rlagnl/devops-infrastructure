@@ -230,6 +230,29 @@ step_1_install_docker() {
     fi
     systemctl enable docker
     systemctl start docker
+
+    # 配置 Docker Hub 镜像加速器: 国内直连 registry-1.docker.io 会 i/o timeout,
+    # 必须配置 registry-mirrors 才能拉取 watchtower 等位于 Docker Hub 的镜像.
+    # 2026 年实测可用的国内加速源(多源回退, 顺序即优先级):
+    #   docker.1ms.run        毫秒镜像
+    #   docker.m.daocloud.io  DaoCloud
+    #   docker.xuanyuan.me    轩辕镜像免费版
+    # 注: 此处覆盖 /etc/docker/daemon.json, 适用于全新部署的服务器.
+    mkdir -p /etc/docker
+    tee /etc/docker/daemon.json > /dev/null <<'EOF'
+{
+    "registry-mirrors": [
+        "https://docker.1ms.run",
+        "https://docker.m.daocloud.io",
+        "https://docker.xuanyuan.me"
+    ],
+    "live-restore": true
+}
+EOF
+    systemctl daemon-reload
+    systemctl restart docker
+    echo "Docker 镜像加速器已配置:"
+    docker info 2>/dev/null | grep -A5 "Registry Mirrors" || cat /etc/docker/daemon.json
 }
 
 # ============ 2. 创建 compose 配置 ============
