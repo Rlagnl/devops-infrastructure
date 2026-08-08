@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Docker 部署引导脚本: 安装 Docker, 创建 compose 配置, 拉取启动服务, 配置 nginx, 启动 Watchtower 自动更新
+# Docker 部署引导脚本: 安装 Docker, 创建 compose 配置, 拉取启动服务, 配置 nginx, 安装注册 Self-hosted Runner
 # 参考 bootstrap.sh 的分步骤执行 + 错误处理 + gum 交互模式
 # GITHUB_USER / GITHUB_PAT 支持三种传入方式:
 #   1) 命令行参数: sudo ./docker_bootstrap.sh -u <user> -t <token>
@@ -140,21 +140,26 @@ prompt_password() {
 # 先读取环境变量作为默认值, 再用命令行参数覆盖, 最后缺失项交由交互式输入补全
 GITHUB_USER="${GITHUB_USER:-}"
 GITHUB_PAT="${GITHUB_PAT:-}"
+# runner 注册的目标仓库(应用仓库), 可用环境变量 RUNNER_REPO 或 -r 参数覆盖
+RUNNER_REPO="${RUNNER_REPO:-ai-chat-demo-app}"
 
 usage() {
     cat >&2 <<EOF
 用法: sudo $0 [-u GitHub用户名] [-t GitHubToken]
   -u  GitHub 用户名 (也可用环境变量 GITHUB_USER 或交互输入)
-  -t  GitHub Personal Access Token (需 write:packages + read:packages 权限)
+  -t  GitHub Personal Access Token (需 repo + write:packages + read:packages 权限)
+      repo: 注册 self-hosted runner; write:packages/read:packages: 推拉 ghcr 镜像
+  -r  Self-hosted Runner 注册的目标仓库 (默认 ai-chat-demo-app, 也可用环境变量 RUNNER_REPO)
   -h  显示帮助
 EOF
     exit 1
 }
 
-while getopts "u:t:h" opt; do
+while getopts "u:t:r:h" opt; do
     case "$opt" in
         u) GITHUB_USER="$OPTARG" ;;
         t) GITHUB_PAT="$OPTARG" ;;
+        r) RUNNER_REPO="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -209,6 +214,7 @@ step_0_collect_credentials() {
     fi
 
     if [[ -z "$GITHUB_PAT" ]]; then
+        echo "Token 需要权限: repo (注册 runner) + write:packages + read:packages (推拉 ghcr 镜像)"
         while true; do
             GITHUB_PAT="$(prompt_password "请输入 GitHub Personal Access Token:")"
             [[ -n "$GITHUB_PAT" ]] && break
@@ -217,6 +223,7 @@ step_0_collect_credentials() {
     else
         echo "已通过参数/环境变量获取 GitHub Token (隐藏显示)"
     fi
+    echo "Self-hosted Runner 将注册到: ${GITHUB_USER}/${RUNNER_REPO}"
 }
 
 # ============ 1. 安装 Docker ============
@@ -231,11 +238,12 @@ step_1_install_docker() {
     systemctl enable docker
     systemctl start docker
 
-    # 配置 Docker Hub 镜像加速器: 国内直连 registry-1.docker.io 会 i/o timeout,
-    # 必须配置 registry-mirrors 才能拉取 watchtower 等位于 Docker Hub 的镜像.
+    # 配置 Docker Hub 镜像加速器: 国内直连 registry-1.docker.io 会 i/o timeout.
+    # 本部署不直接拉 Docker Hub 镜像(app 走 ghcr.io, runner 二进制走 github releases),
+    # 但保留加速器以备未来 docker pull Docker Hub 镜像之用.
     # 只放「全量代理」源, 不要放白名单源(如 docker.m.daocloud.io):
     #   白名单源对非白名单镜像会返回 HTTP 错误, 而 Docker 遇到正常 HTTP 错误不会
-    #   回退到下一个 mirror, 导致 watchtower 这类非白名单镜像拉取直接失败.
+    #   回退到下一个 mirror, 导致非白名单镜像拉取直接失败.
     # 2026 年实测可用的全量代理源(多源回退, 顺序即优先级):
     #   docker.1ms.run       毫秒镜像
     #   docker.xuanyuan.me   轩辕镜像免费版
@@ -329,57 +337,63 @@ NGINX
     systemctl reload nginx
 }
 
-# ============ 5. 启动 Watchtower 自动更新 ============
-step_5_start_watchtower() {
-    # 已存在则先移除, 支持脚本重复执行
-    if docker ps -a --format '{{.Names}}' | grep -q '^watchtower$'; then
-        echo "watchtower 容器已存在, 移除旧容器后重建"
-        docker rm -f watchtower
-    fi
+# ============ 5. 安装注册 Self-hosted Runner ============
+# 替代 Watchtower: build 留在 GitHub 托管 runner(VPS 仅 1GB 内存无法 build),
+# 本机 runner 仅执行轻量的 docker compose pull && up -d, 由 push 触发, 无需 SSH/docker.io
+step_5_setup_runner() {
+    # jq 解析 GitHub API 返回的 JSON
+    command -v jq >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq jq; }
 
-    # watchtower 镜像在 Docker Hub, 国内需经镜像加速代理拉取.
-    # 不依赖 daemon.json 的 registry-mirrors 回退(Docker 遇 HTTP 错误不回退),
-    # 改用「显式前缀拉取 + 重打标签」: 依次尝试多个全量代理源, 成功一个就 retag 成标准名.
-    local watchtower_img="containerrr/watchtower:latest"
-    if ! docker image inspect "$watchtower_img" >/dev/null 2>&1; then
-        # 全量代理源(非白名单), 顺序即优先级. 1ms.run 最稳定放首位.
-        local mirrors=(
-            "docker.1ms.run"
-            "docker.xuanyuan.me"
-            "docker.1panel.live"
-            "dockerproxy.net"
-        )
-        local pulled=0
-        for m in "${mirrors[@]}"; do
-            echo "尝试从镜像源拉取 watchtower: $m/$watchtower_img"
-            # 放在 if 条件里: 失败不会触发 set -e, 继续尝试下一个源
-            if docker pull "$m/$watchtower_img"; then
-                # 重打标签成标准名, 让后续 docker run 用原始镜像名即可
-                docker tag "$m/$watchtower_img" "$watchtower_img"
-                # 移除带前缀的中间标签(底层镜像层因标准名仍被引用而保留)
-                docker rmi "$m/$watchtower_img" >/dev/null 2>&1 || true
-                pulled=1
-                break
-            fi
-        done
-        if [[ "$pulled" -eq 0 ]]; then
-            echo "错误: 所有镜像源均拉取 watchtower 失败"
-            return 1
-        fi
+    # 专用用户 + docker 组: runner 需执行 docker compose, 不以 root 跑 runner(GitHub 安全建议)
+    if ! id github-runner >/dev/null 2>&1; then
+        useradd -m -s /bin/bash github-runner
+    fi
+    usermod -aG docker github-runner
+
+    local runner_dir="/home/github-runner/actions-runner"
+    # 已存在 config.sh 则跳过下载(支持脚本重复执行)
+    if [[ ! -f "$runner_dir/config.sh" ]]; then
+        mkdir -p "$runner_dir"
+        chown github-runner:github-runner "$runner_dir"
+
+        # 取最新 runner 版本号(公共 API, 免鉴权)
+        local ver
+        ver="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest \
+                | jq -r '.tag_name' | sed 's/^v//')"
+
+        # 下载并解压到 runner 用户家目录
+        curl -fsSL "https://github.com/actions/runner/releases/download/v${ver}/actions-runner-linux-x64-${ver}.tar.gz" \
+            | sudo -u github-runner tar xz -C "$runner_dir"
     else
-        echo "watchtower 镜像已存在, 跳过拉取"
+        echo "runner 二进制已存在, 跳过下载"
+    fi
+    cd "$runner_dir"
+
+    # 用 GITHUB_PAT 调 API 拿 registration token(需 repo scope, 一次性, ~1h 过期无需持久化)
+    local reg_token
+    reg_token="$(curl -fsSL -X POST \
+        -H "Authorization: Bearer ${GITHUB_PAT}" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${GITHUB_USER}/${RUNNER_REPO}/actions/runners/registration-token" \
+        | jq -r '.token')"
+    if [[ -z "$reg_token" || "$reg_token" == "null" ]]; then
+        echo "错误: 获取 runner registration token 失败, 请检查 PAT 是否有 repo 权限"
+        return 1
     fi
 
-    docker run -d \
-        --name watchtower \
-        --restart unless-stopped \
-        -v /var/run/docker.sock:/var/run/docker.sock \
-        -e REPO_USER="$GITHUB_USER" \
-        -e REPO_PASS="$GITHUB_PAT" \
-        containerrr/watchtower \
-        --interval 30 \
-        --cleanup \
-        aui-components-doc
+    # 注册 runner(--unattended 免交互, --replace 支持重跑, --labels 供 workflow 路由匹配)
+    sudo -u github-runner ./config.sh --unattended \
+        --url "https://github.com/${GITHUB_USER}/${RUNNER_REPO}" \
+        --token "$reg_token" \
+        --labels "production" \
+        --replace
+
+    # 安装 systemd 服务并启动(开机自启)
+    ./svc.sh install github-runner
+    ./svc.sh start
+
+    echo "Runner 服务状态:"
+    ./svc.sh status 2>/dev/null || systemctl status 'actions.runner.*' --no-pager || true
 }
 
 # ============ 6. 验证部署 ============
@@ -395,6 +409,7 @@ step_6_verify() {
     if [[ "$internal_code" != "200" && "$ext_code" != "200" ]]; then
         echo "警告: 服务未正常响应, 请检查容器日志: docker logs aui-components-doc"
     fi
+    echo "Self-hosted Runner 服务: $(systemctl is-active 'actions.runner.*' 2>/dev/null || echo unknown)"
 }
 
 # ============ 执行所有步骤 ============
@@ -403,7 +418,7 @@ run_step "安装 Docker"               step_1_install_docker
 run_step "创建 compose 配置"         step_2_create_compose
 run_step "登录 ghcr.io 并启动服务"   step_3_login_and_start
 run_step "配置 nginx 反向代理"        step_4_setup_nginx
-run_step "启动 Watchtower 自动更新"  step_5_start_watchtower
+run_step "安装注册 Self-hosted Runner"  step_5_setup_runner
 run_step "验证部署"                  step_6_verify
 
 SERVER_IP="$(curl -s ifconfig.me 2>/dev/null || echo "<服务器IP>")"
@@ -411,5 +426,5 @@ printf '\n%s========================================%s\n' "$GREEN" "$NC"
 printf '%s所有步骤执行完成! 服务已部署成功。%s\n' "$GREEN" "$NC"
 printf '访问地址: http://%s\n' "$SERVER_IP"
 printf '项目目录: /opt/aui-components-doc\n'
-printf 'Watchtower 每 30 秒检查一次镜像更新并自动部署\n'
+printf 'git push 即自动部署 (Self-hosted Runner 拉取 ghcr 镜像并重启)\n'
 printf '%s========================================%s\n' "$GREEN" "$NC"
