@@ -341,9 +341,10 @@ NGINX
 # 替代 Watchtower: build 留在 GitHub 托管 runner(VPS 仅 1GB 内存无法 build),
 # 本机 runner 仅执行轻量的 docker compose pull && up -d, 由 push 触发, 无需 SSH/docker.io
 step_5_setup_runner() {
-    # jq 解析 GitHub API 返回的 JSON
+    echo "确保 jq 已安装(解析 GitHub API 返回的 JSON)..."
     command -v jq >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq jq; }
 
+    echo "创建 github-runner 用户并加入 docker 组(不以 root 跑 runner)..."
     # 专用用户 + docker 组: runner 需执行 docker compose, 不以 root 跑 runner(GitHub 安全建议)
     if ! id github-runner >/dev/null 2>&1; then
         useradd -m -s /bin/bash github-runner
@@ -356,19 +357,47 @@ step_5_setup_runner() {
         mkdir -p "$runner_dir"
         chown github-runner:github-runner "$runner_dir"
 
-        # 取最新 runner 版本号(公共 API, 免鉴权)
+        echo "获取最新 runner 版本号(公共 API, 免鉴权)..."
+        # 取最新 runner 版本号(公共 API, 免鉴权); -s 静默避免污染 $(...) 捕获值
         local ver
         ver="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest \
                 | jq -r '.tag_name' | sed 's/^v//')"
 
-        # 下载并解压到 runner 用户家目录
-        curl -fsSL "https://github.com/actions/runner/releases/download/v${ver}/actions-runner-linux-x64-${ver}.tar.gz" \
-            | sudo -u github-runner tar xz -C "$runner_dir"
+        echo "下载 runner 二进制(约 150MB, 优先国内镜像加速, 显示进度条)..."
+        # runner 包在 github.com releases, 国内直连慢, 用国内加速镜像前缀多源回退.
+        # 镜像用法: <前缀>https://github.com/...  空前缀=直连 github.com(慢但稳, 兜底).
+        # --connect-timeout 10: 仅限制连接握手(死镜像快速失败), 不限制传输(不影响下载完成);
+        #   故不会出现"快下完被超时掐断"的情况.
+        # -f: HTTP 错误失败; -L: 跟随重定向; -#: 进度条(走 stderr, 不进 tar 管道).
+        local runner_url="https://github.com/actions/runner/releases/download/v${ver}/actions-runner-linux-x64-${ver}.tar.gz"
+        local mirrors=(
+            "https://gh-proxy.com/"
+            "https://ghfast.top/"
+            "https://ghproxy.net/"
+            "https://mirror.ghproxy.com/"
+            ""  # 兜底: 直连 github.com
+        )
+        local downloaded=0
+        for m in "${mirrors[@]}"; do
+            echo "尝试下载: ${m:+$m(镜像)}${m:-直连 github.com}"
+            # if 条件内: curl 失败不触发 set -e, 继续下一个源
+            if curl -fL# --connect-timeout 10 "${m}${runner_url}" \
+                | sudo -u github-runner tar xz -C "$runner_dir" 2>/dev/null; then
+                downloaded=1
+                break
+            fi
+            echo "该源失败, 尝试下一个..."
+        done
+        if [[ "$downloaded" -eq 0 ]]; then
+            echo "错误: 所有源下载 runner 二进制均失败"
+            return 1
+        fi
     else
         echo "runner 二进制已存在, 跳过下载"
     fi
     cd "$runner_dir"
 
+    echo "获取 runner registration token(用 GITHUB_PAT 调 API, 一次性 ~1h 过期)..."
     # 用 GITHUB_PAT 调 API 拿 registration token(需 repo scope, 一次性, ~1h 过期无需持久化)
     local reg_token
     reg_token="$(curl -fsSL -X POST \
@@ -381,6 +410,7 @@ step_5_setup_runner() {
         return 1
     fi
 
+    echo "注册 runner(--unattended 免交互, --replace 支持重跑, --labels production)..."
     # 注册 runner(--unattended 免交互, --replace 支持重跑, --labels 供 workflow 路由匹配)
     sudo -u github-runner ./config.sh --unattended \
         --url "https://github.com/${GITHUB_USER}/${RUNNER_REPO}" \
@@ -388,6 +418,7 @@ step_5_setup_runner() {
         --labels "production" \
         --replace
 
+    echo "安装并启动 systemd 服务(开机自启)..."
     # 安装 systemd 服务并启动(开机自启)
     ./svc.sh install github-runner
     ./svc.sh start
