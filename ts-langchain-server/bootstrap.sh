@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# Docker 部署引导脚本: 安装 Docker, 创建 compose 配置, 拉取启动服务, 配置 nginx, 安装注册 Self-hosted Runner
-# 参考 bootstrap.sh 的分步骤执行 + 错误处理 + gum 交互模式
+# Docker 部署引导脚本: 安装 Docker, 创建 compose 配置(三服务), 配置 nginx, 安装注册 Self-hosted Runner
+# 参考 packages/devops-infrastructure/aui-components-doc/docker_bootstrap.sh 结构
+#
+# 与 aui-components-doc 的主要差异:
+#   1. docker-compose.yml 包含 postgres + redis + langgraph-server 三个服务
+#   2. 不创建 .env(由 CI deploy job 从 GitHub Secrets 写入,避免明文凭证残留服务器)
+#   3. 不执行 docker compose up -d(缺少 .env 时 Postgres 启动失败,首次启动交由 CI 完成)
+#   4. nginx 监听 8081,proxy_pass 127.0.0.1:2024,支持 SSE 长连接
+#   5. 数据目录 /opt/ts-langchain-server/
+#
 # GITHUB_USER / GITHUB_PAT 支持三种传入方式:
-#   1) 命令行参数: sudo ./docker_bootstrap.sh -u <user> -t <token>
-#   2) 环境变量:   sudo GITHUB_USER=... GITHUB_PAT=... ./docker_bootstrap.sh
+#   1) 命令行参数: sudo ./bootstrap.sh -u <user> -t <token>
+#   2) 环境变量:   sudo GITHUB_USER=... GITHUB_PAT=... ./bootstrap.sh
 #   3) 交互式输入: 不传任何参数, 脚本运行后用 gum/read 提示输入
 
 set -euo pipefail  # 未定义变量报错, 管道失败传递, 命令失败由 ERR trap 统一处理并退出
@@ -40,13 +48,10 @@ STEP_LOG=""       # 当前步骤输出日志临时文件路径(用于失败时�
 # ============ 错误处理: 任意命令失败时触发 ============
 on_error() {
     local code=$?
-    # 仅在有步骤上下文时打印, 避免脚本启动前的意外错误也走这里
     if [[ -n "$STEP_DESC" ]]; then
-        # 绕过 run_step 里的 tee 重定向, 直接写原始终端, 避免污染 $STEP_LOG
         exec 1>&3 2>&4
         printf '\n%s========================================%s\n' "$RED" "$NC"
         printf '%s[失败] 步骤 %s: %s (退出码: %s)%s\n' "$RED" "$STEP_NUM" "$STEP_DESC" "$code" "$NC"
-        # 等待 tee 刷新缓冲, 然后提取最近输出作为错误信息
         if [[ -n "$STEP_LOG" && -f "$STEP_LOG" ]]; then
             sleep 0.1
             printf '%s最近输出(错误信息):%s\n' "$RED" "$NC"
@@ -55,35 +60,28 @@ on_error() {
         printf '%s========================================%s\n' "$RED" "$NC"
         printf '%s脚本因步骤 %s 失败而终止。%s\n' "$RED" "$STEP_NUM" "$NC"
     fi
-    # 清理临时日志
     [[ -n "$STEP_LOG" && -f "$STEP_LOG" ]] && rm -f "$STEP_LOG"
     exit "$code"
 }
 trap on_error ERR
 
 # ============ gum 自动检测 + 静默回退 ============
-# 设计目标: 在「系统已装 gum」→「apt 安装 gum」→「回退到 read」三级中自动降级,
-# 任何环节失败都不影响脚本继续运行, 只是交互体验从 TUI 退化为普通 read.
 GUM_BIN=""
 
 ensure_gum() {
-    # 1) 系统已安装: 直接复用 PATH 中的 gum
     if command -v gum >/dev/null 2>&1; then
         GUM_BIN="$(command -v gum)"
         return 0
     fi
 
-    # 2) 通过 apt 安装 (稳定优先, 版本旧一点可接受)
     printf '%s[gum]%s 未检测到 gum, 尝试通过 apt 安装...\n' "$YELLOW" "$NC" >/dev/tty
 
-    # 避免 apt 交互式提示卡住脚本
     export DEBIAN_FRONTEND=noninteractive
     local apt_log
     apt_log="$(mktemp)"
 
     if apt-get update -qq >"$apt_log" 2>&1 \
         && apt-get install -y -qq gum >>"$apt_log" 2>&1; then
-        # 验证安装真的成功
         if command -v gum >/dev/null 2>&1; then
             GUM_BIN="$(command -v gum)"
             printf '%s[gum]%s 安装成功, 将使用 TUI 交互模式\n' "$GREEN" "$NC" >/dev/tty
@@ -92,7 +90,6 @@ ensure_gum() {
         fi
     fi
 
-    # 3) apt 失败: 打印日志末尾帮助诊断, 回退到 read (不影响主流程)
     printf '%s[gum]%s apt 安装失败, 回退到普通 read 交互模式\n' "$YELLOW" "$NC" >/dev/tty
     if [[ -s "$apt_log" ]]; then
         printf '%s[gum]%s apt 日志(最后 10 行):\n%s\n' "$YELLOW" "$NC" \
@@ -102,12 +99,10 @@ ensure_gum() {
     return 0
 }
 
-# 通用文本输入: 优先 gum input, 失败回退到 read </dev/tty
 prompt_input() {
     local prompt="$1"
     local value
     if [[ -n "$GUM_BIN" ]]; then
-        # gum 的 TUI 走 stderr, 必须显式重定向到 /dev/tty, 否则在 run_step 的 tee 包裹下会拒绝渲染
         if value="$("$GUM_BIN" input --header "$prompt" --prompt "> " --width 50 \
                         </dev/tty 2>/dev/tty)"; then
             printf '%s' "$value"
@@ -118,7 +113,6 @@ prompt_input() {
     printf '%s' "$value"
 }
 
-# 密码输入: 优先 gum input --password, 失败回退到 read -s </dev/tty
 prompt_password() {
     local prompt="$1"
     local value
@@ -129,18 +123,14 @@ prompt_password() {
             return 0
         fi
     fi
-    # -s 静默模式不回显, 防止 token 明文出现在屏幕/日志
     read -rs -p "$prompt" value </dev/tty
-    # -s 不会在回车后换行, 补一个换行到 /dev/tty (不能用 echo, 会被 $(...) 捕获)
     echo > /dev/tty
     printf '%s' "$value"
 }
 
 # ============ 参数解析 ============
-# 先读取环境变量作为默认值, 再用命令行参数覆盖, 最后缺失项交由交互式输入补全
 GITHUB_USER="${GITHUB_USER:-}"
 GITHUB_PAT="${GITHUB_PAT:-}"
-# runner 注册的目标仓库(应用仓库), 可用环境变量 RUNNER_REPO 或 -r 参数覆盖
 RUNNER_REPO="${RUNNER_REPO:-ai-chat-demo-app}"
 
 usage() {
@@ -165,11 +155,9 @@ while getopts "u:t:r:h" opt; do
     esac
 done
 
-# 在 trap 安装后尽早探测 gum, 让后续 prompt_* 都能直接使用 GUM_BIN
 ensure_gum
 
 # ============ 步骤执行器 ============
-# 用法: run_step "步骤描述" step_function_name
 run_step() {
     local desc="$1"
     local func="$2"
@@ -177,22 +165,16 @@ run_step() {
     STEP_DESC="$desc"
     STEP_LOG="$(mktemp)"
 
-    # —— 执行前 ——
     printf '\n%s========================================%s\n' "$BLUE" "$NC"
     printf '%s步骤 %s: %s%s\n' "$BLUE" "$STEP_NUM" "$desc" "$NC"
     printf '%s[状态] 开始执行...%s\n' "$YELLOW" "$NC"
     printf '%s----------------------------------------%s\n' "$BLUE" "$NC"
 
     local start_time=$SECONDS
-
-    # —— 执行中 ——
-    # 进程替换不会为函数创建子 shell, 因此 cd/export 等副作用会保留到后续步骤
     "$func" > >(tee "$STEP_LOG") 2>&1
-
     local duration=$((SECONDS - start_time))
     sleep 0.1
 
-    # —— 执行后(成功) ——
     printf '%s----------------------------------------%s\n' "$GREEN" "$NC"
     printf '%s[状态] 步骤 %s [成功] - %s (耗时 %ss)%s\n' "$GREEN" "$STEP_NUM" "$desc" "$duration" "$NC"
 
@@ -202,7 +184,6 @@ run_step() {
 
 # ============ 0. 收集 GitHub 凭证 ============
 step_0_collect_credentials() {
-    # 命令行/环境变量已提供则跳过交互, 否则提示输入
     if [[ -z "$GITHUB_USER" ]]; then
         while true; do
             GITHUB_USER="$(prompt_input "请输入 GitHub 用户名:")"
@@ -232,25 +213,16 @@ step_1_install_docker() {
     if command -v docker >/dev/null 2>&1; then
         echo "Docker 已安装, 跳过安装步骤"
     else
-        # Aliyun 镜像源加速, 国内服务器拉取 docker-ce 更稳定
         curl -fsSL https://get.docker.com | bash -s docker --mirror Aliyun
     fi
     systemctl enable docker
     systemctl start docker
 
-    # 配置 Docker Hub 镜像加速器: 国内直连 registry-1.docker.io 会 i/o timeout.
-    # 本部署不直接拉 Docker Hub 镜像(app 走 ghcr.io, runner 二进制走 github releases),
-    # 但保留加速器以备未来 docker pull Docker Hub 镜像之用.
-    # 只放「全量代理」源, 不要放白名单源(如 docker.m.daocloud.io):
-    #   白名单源对非白名单镜像会返回 HTTP 错误, 而 Docker 遇到正常 HTTP 错误不会
-    #   回退到下一个 mirror, 导致非白名单镜像拉取直接失败.
-    # 2026 年实测可用的全量代理源(多源回退, 顺序即优先级):
-    #   docker.1ms.run       毫秒镜像
-    #   docker.xuanyuan.me   轩辕镜像免费版
-    #   docker.1panel.live   1Panel
-    # 注: 此处覆盖 /etc/docker/daemon.json, 适用于全新部署的服务器.
+    # 配置 Docker Hub 镜像加速器: postgres/redis 镜像从 Docker Hub 拉取
     mkdir -p /etc/docker
-    tee /etc/docker/daemon.json > /dev/null <<'EOF'
+    # 仅在 daemon.json 不存在时写入, 避免覆盖已有配置(幂等)
+    if [[ ! -f /etc/docker/daemon.json ]]; then
+        tee /etc/docker/daemon.json > /dev/null <<'EOF'
 {
     "registry-mirrors": [
         "https://docker.1ms.run",
@@ -260,45 +232,95 @@ step_1_install_docker() {
     "live-restore": true
 }
 EOF
-    systemctl daemon-reload
-    systemctl restart docker
-    echo "Docker 镜像加速器已配置:"
+        systemctl daemon-reload
+        systemctl restart docker
+    else
+        echo "daemon.json 已存在, 跳过镜像加速器配置"
+    fi
+    echo "Docker 镜像加速器配置:"
     docker info 2>/dev/null | grep -A5 "Registry Mirrors" || cat /etc/docker/daemon.json
 }
 
 # ============ 2. 创建 compose 配置 ============
+# 生产版 compose: 拉取 ghcr 镜像, 无 build 字段
+# 注意: 不创建 .env, 由 CI deploy job 从 GitHub Secrets 写入
+# 注意: 不执行 docker compose up, 缺 .env 时 Postgres 启动失败, 首次启动交由 CI
 step_2_create_compose() {
-    mkdir -p /opt/aui-components-doc
-    cd /opt/aui-components-doc
+    mkdir -p /opt/ts-langchain-server
+    cd /opt/ts-langchain-server
+
     # EOF 不加引号: ${GITHUB_USER} 需要被 shell 展开写入镜像地址
-    # ${GITHUB_USER,,} 仅在此处把用户名转小写: ghcr.io 镜像路径不允许大写字母
-    # (docker login / watchtower 的 REPO_USER 仍用原始大小写, GitHub 鉴权大小写无关)
+    # ${GITHUB_USER,,} 把用户名转小写: ghcr.io 镜像路径不允许大写字母
+    # 端口映射 2024:8000: 容器内 LangGraph Server 监听 8000(由 langgraphjs build 生成)
     cat > docker-compose.yml << EOF
 services:
-  aui-docs:
-    image: ghcr.io/${GITHUB_USER,,}/aui-components-doc:latest
-    container_name: aui-components-doc
+  postgres:
+    image: postgres:16-alpine
+    container_name: ts-langchain-postgres
+    env_file: .env
+    environment:
+      POSTGRES_USER: langgraph
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      POSTGRES_DB: langgraph
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langgraph"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: ts-langchain-redis
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  langgraph-server:
+    image: ghcr.io/${GITHUB_USER,,}/ts-langchain-server:latest
+    container_name: ts-langchain-server
+    env_file: .env
+    environment:
+      POSTGRES_URI: postgres://langgraph:\${POSTGRES_PASSWORD}@postgres:5432/langgraph
+      REDIS_URI: redis://redis:6379
     ports:
-      - "127.0.0.1:3000:80"
+      - "127.0.0.1:2024:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/ok"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 5s
+      start_period: 10s
+
+volumes:
+  pgdata:
+  redisdata:
 EOF
     echo "docker-compose.yml 已生成:"
     cat docker-compose.yml
 }
 
-# ============ 3. 登录 ghcr.io 并拉取启动服务 ============
-step_3_login_and_start() {
-    cd /opt/aui-components-doc
-    # password-stdin: 避免 token 出现在命令行参数/进程列表(/proc/<pid>/cmdline)中
+# ============ 3. 登录 ghcr.io ============
+# 仅登录, 不执行 docker compose up -d
+# .env 文件由 CI deploy job 首次部署时从 GitHub Secrets 写入
+step_3_login_ghcr() {
+    cd /opt/ts-langchain-server
+    # password-stdin: 避免 token 出现在命令行参数/进程列表中
     echo "$GITHUB_PAT" | docker login ghcr.io -u "$GITHUB_USER" --password-stdin
-    docker compose pull
-    docker compose up -d
+    echo "ghcr.io 登录成功, 首次镜像拉取将由 CI deploy job 执行"
 }
 
 # ============ 4. 配置 nginx 反向代理 ============
@@ -312,75 +334,74 @@ step_4_setup_nginx() {
     systemctl start nginx
 
     # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开
-    tee /etc/nginx/sites-available/aui-components-doc > /dev/null <<'NGINX'
+    # proxy_buffering off + proxy_cache off: 支持 SSE 流式响应(LangGraph stream 端点)
+    # proxy_read_timeout 86400s: SSE 长连接超时设为 24 小时
+    tee /etc/nginx/sites-available/ts-langchain-server > /dev/null <<'NGINX'
 server {
-    listen 8082;
+    listen 8081;
     server_name _;
+
+    # 关闭缓冲, 支持 SSE 流式响应
+    proxy_buffering off;
+    proxy_cache off;
+
     location / {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:2024;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        # WebSocket 支持
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
+
+        # SSE 长连接支持
+        proxy_set_header Connection "";
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
     }
 }
 NGINX
     # 移除 nginx 默认站点(遵循工作区规则: 避免 80 端口显示 "Welcome to nginx")
     rm -f /etc/nginx/sites-enabled/default
-    ln -sf /etc/nginx/sites-available/aui-components-doc /etc/nginx/sites-enabled/aui-components-doc
-    # 测试配置语法, 出错就退出不 reload
+    ln -sf /etc/nginx/sites-available/ts-langchain-server /etc/nginx/sites-enabled/ts-langchain-server
     nginx -t
     systemctl reload nginx
 }
 
 # ============ 5. 安装注册 Self-hosted Runner ============
-# 替代 Watchtower: build 留在 GitHub 托管 runner(VPS 仅 1GB 内存无法 build),
-# 本机 runner 仅执行轻量的 docker compose pull && up -d, 由 push 触发, 无需 SSH/docker.io
+# build 留在 GitHub 托管 runner, 本机 runner 仅执行轻量的 docker compose pull && up -d
 step_5_setup_runner() {
     echo "确保 jq 已安装(解析 GitHub API 返回的 JSON)..."
     command -v jq >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq jq; }
 
     echo "创建 github-runner 用户并加入 docker 组(不以 root 跑 runner)..."
-    # 专用用户 + docker 组: runner 需执行 docker compose, 不以 root 跑 runner(GitHub 安全建议)
     if ! id github-runner >/dev/null 2>&1; then
         useradd -m -s /bin/bash github-runner
     fi
     usermod -aG docker github-runner
 
     local runner_dir="/home/github-runner/actions-runner"
-    # 已存在 config.sh 则跳过下载(支持脚本重复执行)
+    # 幂等: 已存在 config.sh 则跳过下载(支持脚本重复执行)
     if [[ ! -f "$runner_dir/config.sh" ]]; then
         mkdir -p "$runner_dir"
         chown github-runner:github-runner "$runner_dir"
 
         echo "获取最新 runner 版本号(公共 API, 免鉴权)..."
-        # 取最新 runner 版本号(公共 API, 免鉴权); -s 静默避免污染 $(...) 捕获值
         local ver
         ver="$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest \
                 | jq -r '.tag_name' | sed 's/^v//')"
 
-        echo "下载 runner 二进制(约 150MB, 优先国内镜像加速, 显示进度条)..."
-        # runner 包在 github.com releases, 国内直连慢, 用国内加速镜像前缀多源回退.
-        # 镜像用法: <前缀>https://github.com/...  空前缀=直连 github.com(慢但稳, 兜底).
-        # --connect-timeout 10: 仅限制连接握手(死镜像快速失败), 不限制传输(不影响下载完成);
-        #   故不会出现"快下完被超时掐断"的情况.
-        # -f: HTTP 错误失败; -L: 跟随重定向; -#: 进度条(走 stderr, 不进 tar 管道).
+        echo "下载 runner 二进制(约 150MB, 优先国内镜像加速)..."
         local runner_url="https://github.com/actions/runner/releases/download/v${ver}/actions-runner-linux-x64-${ver}.tar.gz"
         local mirrors=(
             "https://gh-proxy.com/"
             "https://ghfast.top/"
             "https://ghproxy.net/"
             "https://mirror.ghproxy.com/"
-            ""  # 兜底: 直连 github.com
+            ""
         )
         local downloaded=0
         for m in "${mirrors[@]}"; do
             echo "尝试下载: ${m:+$m(镜像)}${m:-直连 github.com}"
-            # if 条件内: curl 失败不触发 set -e, 继续下一个源
             if curl -fL# --connect-timeout 10 "${m}${runner_url}" \
                 | sudo -u github-runner tar xz -C "$runner_dir" 2>/dev/null; then
                 downloaded=1
@@ -398,7 +419,6 @@ step_5_setup_runner() {
     cd "$runner_dir"
 
     echo "获取 runner registration token(用 GITHUB_PAT 调 API, 一次性 ~1h 过期)..."
-    # 用 GITHUB_PAT 调 API 拿 registration token(需 repo scope, 一次性, ~1h 过期无需持久化)
     local reg_token
     reg_token="$(curl -fsSL -X POST \
         -H "Authorization: Bearer ${GITHUB_PAT}" \
@@ -411,7 +431,6 @@ step_5_setup_runner() {
     fi
 
     echo "注册 runner(--unattended 免交互, --replace 支持重跑, --labels production)..."
-    # 注册 runner(--unattended 免交互, --replace 支持重跑, --labels 供 workflow 路由匹配)
     sudo -u github-runner ./config.sh --unattended \
         --url "https://github.com/${GITHUB_USER}/${RUNNER_REPO}" \
         --token "$reg_token" \
@@ -419,7 +438,6 @@ step_5_setup_runner() {
         --replace
 
     echo "安装并启动 systemd 服务(开机自启)..."
-    # 安装 systemd 服务并启动(开机自启)
     ./svc.sh install github-runner
     ./svc.sh start
 
@@ -427,35 +445,56 @@ step_5_setup_runner() {
     ./svc.sh status 2>/dev/null || systemctl status 'actions.runner.*' --no-pager || true
 }
 
-# ============ 6. 验证部署 ============
+# ============ 6. 验证部署准备 ============
+# 注意: 服务尚未启动(.env 由 CI 写入), 仅验证基础设施配置
 step_6_verify() {
-    # 容器刚启动需要短暂时间进入 ready 状态
-    sleep 2
-    local internal_code ext_code
-    # || echo "000" 兜底: 连接失败时 curl 返回非 0, 用 000 表示不可达, 不触发 set -e
-    internal_code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000 || echo "000")"
-    ext_code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8082 || echo "000")"
-    echo "容器内部响应(127.0.0.1:3000): $internal_code"
-    echo "nginx 转发响应(127.0.0.1:8082): $ext_code"
-    if [[ "$internal_code" != "200" && "$ext_code" != "200" ]]; then
-        echo "警告: 服务未正常响应, 请检查容器日志: docker logs aui-components-doc"
+    echo "=== 基础设施验证 ==="
+
+    # 检查 docker-compose.yml
+    if [[ -f /opt/ts-langchain-server/docker-compose.yml ]]; then
+        echo "[OK] docker-compose.yml 已生成"
+    else
+        echo "[FAIL] docker-compose.yml 不存在"
     fi
-    echo "Self-hosted Runner 服务: $(systemctl is-active 'actions.runner.*' 2>/dev/null || echo unknown)"
+
+    # 检查 nginx 配置
+    local nginx_code
+    nginx_code="$(nginx -t 2>&1 || echo "FAIL")"
+    if [[ "$nginx_code" != "FAIL" ]]; then
+        echo "[OK] nginx 配置语法正确"
+    else
+        echo "[FAIL] nginx 配置语法错误"
+    fi
+
+    # 检查 Runner 服务
+    local runner_status
+    runner_status="$(systemctl is-active 'actions.runner.*' 2>/dev/null || echo unknown)"
+    echo "Self-hosted Runner 服务状态: $runner_status"
+
+    echo ""
+    echo "=== 后续步骤 ==="
+    echo "1. 在 GitHub 仓库配置 9 个 Secrets(见部署方案 4.2 节)"
+    echo "2. 确认仓库 Workflow permissions 设为 Read and write"
+    echo "3. 提交代码 push 到 develop 分支触发 CI"
+    echo "4. CI deploy job 会自动写入 .env 并执行 docker compose up -d"
+    echo "5. 部署完成后访问: http://<服务器IP>:8081/ok"
 }
 
 # ============ 执行所有步骤 ============
 run_step "收集 GitHub 凭证"          step_0_collect_credentials
 run_step "安装 Docker"               step_1_install_docker
 run_step "创建 compose 配置"         step_2_create_compose
-run_step "登录 ghcr.io 并启动服务"   step_3_login_and_start
+run_step "登录 ghcr.io"              step_3_login_ghcr
 run_step "配置 nginx 反向代理"        step_4_setup_nginx
 run_step "安装注册 Self-hosted Runner"  step_5_setup_runner
-run_step "验证部署"                  step_6_verify
+run_step "验证部署准备"              step_6_verify
 
 SERVER_IP="$(curl -s ifconfig.me 2>/dev/null || echo "<服务器IP>")"
 printf '\n%s========================================%s\n' "$GREEN" "$NC"
-printf '%s所有步骤执行完成! 服务已部署成功。%s\n' "$GREEN" "$NC"
-printf '访问地址: http://%s:8082\n' "$SERVER_IP"
-printf '项目目录: /opt/aui-components-doc\n'
-printf 'git push 即自动部署 (Self-hosted Runner 拉取 ghcr 镜像并重启)\n'
+printf '%s基础设施初始化完成!%s\n' "$GREEN" "$NC"
+printf '项目目录: /opt/ts-langchain-server\n'
+printf 'nginx 端口: 8081 (对外)\n'
+printf '内部端口: 127.0.0.1:2024 (容器内 8000)\n'
+printf '\n下一步: 在 GitHub 配置 Secrets 并 push 到 develop 触发 CI\n'
+printf '部署完成后访问: http://%s:8081/ok\n' "$SERVER_IP"
 printf '%s========================================%s\n' "$GREEN" "$NC"
