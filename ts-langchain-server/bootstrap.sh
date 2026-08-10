@@ -299,7 +299,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/ok"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/ok"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -378,6 +378,10 @@ step_5_setup_runner() {
         useradd -m -s /bin/bash github-runner
     fi
     usermod -aG docker github-runner
+
+    # deploy job 以 github-runner 用户运行, 需要对项目目录有写权限(写 .env、执行 docker compose)
+    # /opt/ts-langchain-server 由 step_2 以 root 创建, 这里移交所有者
+    chown -R github-runner:github-runner /opt/ts-langchain-server
 
     local runner_dir="/home/github-runner/actions-runner"
     # 幂等: 已存在 config.sh 则跳过下载(支持脚本重复执行)
