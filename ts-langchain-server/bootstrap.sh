@@ -418,6 +418,17 @@ step_5_setup_runner() {
     fi
     cd "$runner_dir"
 
+    # 幂等: runner 已配置且 systemd 服务已安装时, 直接复用, 不重新注册
+    # 避免每次重跑脚本都在 GitHub 上产生重复的 Offline runner 记录
+    if [[ -f .runner ]] && systemctl list-unit-files --type=service 'actions.runner.*' --no-legend --no-pager 2>/dev/null | grep -q 'actions.runner'; then
+        echo "Runner 已配置且 systemd 服务已安装, 跳过注册, 直接复用现有 runner"
+        # 确保服务正在运行(可能因服务器重启而停止)
+        ./svc.sh start 2>/dev/null || true
+        echo "Runner 服务状态:"
+        ./svc.sh status 2>/dev/null || systemctl status 'actions.runner.*' --no-pager || true
+        return 0
+    fi
+
     echo "获取 runner registration token(用 GITHUB_PAT 调 API, 一次性 ~1h 过期)..."
     local reg_token
     reg_token="$(curl -fsSL -X POST \
@@ -431,6 +442,15 @@ step_5_setup_runner() {
     fi
 
     echo "注册 runner(--unattended 免交互, --replace 支持重跑, --labels production)..."
+    # 处理 .runner 存在但 systemd 服务未安装的情况(上次注册后 svc.sh install 失败)
+    # 此时 config.sh 会报 "already configured", 需要先 remove 再重新注册
+    if [[ -f .runner ]]; then
+        echo "检测到旧配置残留(.runner 存在但服务未安装), 先移除..."
+        sudo -u github-runner ./config.sh remove --token "$reg_token" || {
+            echo "移除旧配置失败(可能已在 GitHub 侧注销), 清理本地残留文件..."
+            rm -f .runner .credentials .credentials_rsaparams
+        }
+    fi
     sudo -u github-runner ./config.sh --unattended \
         --url "https://github.com/${GITHUB_USER}/${RUNNER_REPO}" \
         --token "$reg_token" \
