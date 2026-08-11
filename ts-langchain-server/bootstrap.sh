@@ -80,6 +80,12 @@ ensure_gum() {
     local apt_log
     apt_log="$(mktemp)"
 
+    # gum 不在 Ubuntu/Debian 默认源中, 需先添加 charmbracelet apt 源
+    # 幂等: 源文件已存在则跳过
+    if [[ ! -f /etc/apt/sources.list.d/charm.list ]]; then
+        echo "deb [trusted=yes] https://repo.charm.sh/apt/ /" > /etc/apt/sources.list.d/charm.list
+    fi
+
     if apt-get update -qq >"$apt_log" 2>&1 \
         && apt-get install -y -qq gum >>"$apt_log" 2>&1; then
         if command -v gum >/dev/null 2>&1; then
