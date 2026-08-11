@@ -245,6 +245,10 @@ EOF
     fi
     echo "Docker 镜像加速器配置:"
     docker info 2>/dev/null | grep -A5 "Registry Mirrors" || cat /etc/docker/daemon.json
+
+    # 创建 Docker 共享网络(容器间通信, 幂等)
+    # 其他子项目(如 langgraph-aui-app)通过此网络用容器名访问 ts-langchain-server:8000
+    docker network create app-network 2>/dev/null || echo "app-network 已存在, 跳过创建"
 }
 
 # ============ 2. 创建 compose 配置 ============
@@ -303,6 +307,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      - default
+      - app-network
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/ok"]
@@ -314,6 +321,10 @@ services:
 volumes:
   pgdata:
   redisdata:
+
+networks:
+  app-network:
+    external: true
 EOF
     echo "docker-compose.yml 已生成:"
     cat docker-compose.yml

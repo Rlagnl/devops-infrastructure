@@ -249,6 +249,7 @@ EOF
 # ============ 2. 创建 compose 配置 ============
 # 单服务 compose: langgraph-aui-app,env_file: .env(由 CI 写入)
 # 不创建 .env, 不执行 docker compose up -d(缺 .env 时首次启动交由 CI)
+# networks: app-network 外部网络, 与 ts-langchain-server 共享, 用容器名通信
 step_2_create_compose() {
     mkdir -p /opt/langgraph-aui-app
     cd /opt/langgraph-aui-app
@@ -263,6 +264,8 @@ services:
     env_file: .env
     ports:
       - "127.0.0.1:3001:3000"
+    networks:
+      - app-network
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/"]
@@ -270,6 +273,10 @@ services:
       timeout: 5s
       retries: 3
       start_period: 5s
+
+networks:
+  app-network:
+    external: true
 EOF
     echo "docker-compose.yml 已生成:"
     cat docker-compose.yml
@@ -456,7 +463,7 @@ step_6_verify() {
     echo ""
     echo "=== 后续步骤 ==="
     echo "1. 在 GitHub 仓库配置 2 个 Variables(非敏感, 日志可见):"
-    echo "   - LANGGRAPH_API_URL=http://127.0.0.1:2024"
+    echo "   - LANGGRAPH_API_URL=http://ts-langchain-server:8000"
     echo "   - NEXT_PUBLIC_LANGGRAPH_ASSISTANT_ID=agent"
     echo "2. 确认仓库 Workflow permissions 设为 Read and write"
     echo "3. 提交代码 push 到 develop 分支触发 CI(或手动 workflow_dispatch)"
