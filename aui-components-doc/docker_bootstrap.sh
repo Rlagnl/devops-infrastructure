@@ -5,6 +5,10 @@
 #   1) 命令行参数: sudo ./docker_bootstrap.sh -u <user> -t <token>
 #   2) 环境变量:   sudo GITHUB_USER=... GITHUB_PAT=... ./docker_bootstrap.sh
 #   3) 交互式输入: 不传任何参数, 脚本运行后用 gum/read 提示输入
+#
+# ACR_USERNAME / ACR_PASSWORD 支持两种传入方式:
+#   1) 环境变量:   sudo ACR_USERNAME=... ACR_PASSWORD=... ./docker_bootstrap.sh
+#   2) 交互式输入: 不传环境变量, 脚本运行后用 gum/read 提示输入
 
 set -euo pipefail  # 未定义变量报错, 管道失败传递, 命令失败由 ERR trap 统一处理并退出
 set -E             # errtrace: 让 ERR trap 传播进 step_* 函数内部
@@ -146,6 +150,8 @@ prompt_password() {
 # 先读取环境变量作为默认值, 再用命令行参数覆盖, 最后缺失项交由交互式输入补全
 GITHUB_USER="${GITHUB_USER:-}"
 GITHUB_PAT="${GITHUB_PAT:-}"
+ACR_USERNAME="${ACR_USERNAME:-}"
+ACR_PASSWORD="${ACR_PASSWORD:-}"
 # runner 注册的目标仓库(应用仓库), 可用环境变量 RUNNER_REPO 或 -r 参数覆盖
 RUNNER_REPO="${RUNNER_REPO:-ai-chat-demo-app}"
 
@@ -153,8 +159,8 @@ usage() {
     cat >&2 <<EOF
 用法: sudo $0 [-u GitHub用户名] [-t GitHubToken]
   -u  GitHub 用户名 (也可用环境变量 GITHUB_USER 或交互输入)
-  -t  GitHub Personal Access Token (需 repo + write:packages + read:packages 权限)
-      repo: 注册 self-hosted runner; write:packages/read:packages: 推拉 ghcr 镜像
+  -t  GitHub Personal Access Token (需 repo 权限)
+      repo: 注册 self-hosted runner (镜像拉取走 ACR, 不再需要 packages 权限)
   -r  Self-hosted Runner 注册的目标仓库 (默认 ai-chat-demo-app, 也可用环境变量 RUNNER_REPO)
   -h  显示帮助
 EOF
@@ -220,7 +226,7 @@ step_0_collect_credentials() {
     fi
 
     if [[ -z "$GITHUB_PAT" ]]; then
-        echo "Token 需要权限: repo (注册 runner) + write:packages + read:packages (推拉 ghcr 镜像)"
+        echo "Token 需要权限: repo (注册 runner)。镜像拉取走 ACR，不再需要 packages 权限"
         while true; do
             GITHUB_PAT="$(prompt_password "请输入 GitHub Personal Access Token:")"
             [[ -n "$GITHUB_PAT" ]] && break
@@ -230,6 +236,28 @@ step_0_collect_credentials() {
         echo "已通过参数/环境变量获取 GitHub Token (隐藏显示)"
     fi
     echo "Self-hosted Runner 将注册到: ${GITHUB_USER}/${RUNNER_REPO}"
+
+    if [[ -z "$ACR_USERNAME" ]]; then
+        echo ""
+        echo "阿里云 ACR 登录凭证(用于拉取镜像):"
+        while true; do
+            ACR_USERNAME="$(prompt_input "请输入 ACR 用户名:")"
+            [[ -n "$ACR_USERNAME" ]] && break
+            echo "ACR 用户名不能为空, 请重新输入"
+        done
+    else
+        echo "已通过环境变量获取 ACR 用户名: $ACR_USERNAME"
+    fi
+
+    if [[ -z "$ACR_PASSWORD" ]]; then
+        while true; do
+            ACR_PASSWORD="$(prompt_password "请输入 ACR 密码:")"
+            [[ -n "$ACR_PASSWORD" ]] && break
+            echo "ACR 密码不能为空, 请重新输入"
+        done
+    else
+        echo "已通过环境变量获取 ACR 密码(隐藏显示)"
+    fi
 }
 
 # ============ 1. 安装 Docker ============
@@ -245,7 +273,7 @@ step_1_install_docker() {
     systemctl start docker
 
     # 配置 Docker Hub 镜像加速器: 国内直连 registry-1.docker.io 会 i/o timeout.
-    # 本部署不直接拉 Docker Hub 镜像(app 走 ghcr.io, runner 二进制走 github releases),
+    # 本部署不直接拉 Docker Hub 镜像(app 走 ACR, runner 二进制走 github releases),
     # 但保留加速器以备未来 docker pull Docker Hub 镜像之用.
     # 只放「全量代理」源, 不要放白名单源(如 docker.m.daocloud.io):
     #   白名单源对非白名单镜像会返回 HTTP 错误, 而 Docker 遇到正常 HTTP 错误不会
@@ -277,12 +305,11 @@ step_2_create_compose() {
     mkdir -p /opt/aui-components-doc
     cd /opt/aui-components-doc
     # EOF 不加引号: ${GITHUB_USER} 需要被 shell 展开写入镜像地址
-    # ${GITHUB_USER,,} 仅在此处把用户名转小写: ghcr.io 镜像路径不允许大写字母
-    # (docker login / watchtower 的 REPO_USER 仍用原始大小写, GitHub 鉴权大小写无关)
+    # ${GITHUB_USER,,} 把用户名转小写: ACR 命名空间即 GitHub 用户名小写
     cat > docker-compose.yml << EOF
 services:
   aui-docs:
-    image: ghcr.io/${GITHUB_USER,,}/aui-components-doc:latest
+    image: crpi-y8mr1jotakimjtk3.cn-wulanchabu.personal.cr.aliyuncs.com/${GITHUB_USER,,}/aui-components-doc:latest
     container_name: aui-components-doc
     ports:
       - "127.0.0.1:3000:80"
@@ -298,11 +325,11 @@ EOF
     cat docker-compose.yml
 }
 
-# ============ 3. 登录 ghcr.io 并拉取启动服务 ============
+# ============ 3. 登录阿里云 ACR 并启动服务 ============
 step_3_login_and_start() {
     cd /opt/aui-components-doc
-    # password-stdin: 避免 token 出现在命令行参数/进程列表(/proc/<pid>/cmdline)中
-    echo "$GITHUB_PAT" | docker login ghcr.io -u "$GITHUB_USER" --password-stdin
+    # password-stdin: 避免 ACR 密码出现在命令行参数/进程列表(/proc/<pid>/cmdline)中
+    echo "$ACR_PASSWORD" | docker login crpi-y8mr1jotakimjtk3.cn-wulanchabu.personal.cr.aliyuncs.com -u "$ACR_USERNAME" --password-stdin
     docker compose pull
     docker compose up -d
 }
@@ -453,7 +480,7 @@ step_6_verify() {
 run_step "收集 GitHub 凭证"          step_0_collect_credentials
 run_step "安装 Docker"               step_1_install_docker
 run_step "创建 compose 配置"         step_2_create_compose
-run_step "登录 ghcr.io 并启动服务"   step_3_login_and_start
+run_step "登录阿里云 ACR 并启动服务"   step_3_login_and_start
 run_step "配置 nginx 反向代理"        step_4_setup_nginx
 run_step "安装注册 Self-hosted Runner"  step_5_setup_runner
 run_step "验证部署"                  step_6_verify
@@ -463,5 +490,5 @@ printf '\n%s========================================%s\n' "$GREEN" "$NC"
 printf '%s所有步骤执行完成! 服务已部署成功。%s\n' "$GREEN" "$NC"
 printf '访问地址: http://%s:8082\n' "$SERVER_IP"
 printf '项目目录: /opt/aui-components-doc\n'
-printf 'git push 即自动部署 (Self-hosted Runner 拉取 ghcr 镜像并重启)\n'
+printf 'git push 即自动部署 (Self-hosted Runner 拉取 ACR 镜像并重启)\n'
 printf '%s========================================%s\n' "$GREEN" "$NC"

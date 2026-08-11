@@ -13,6 +13,10 @@
 #   1) 命令行参数: sudo ./bootstrap.sh -u <user> -t <token>
 #   2) 环境变量:   sudo GITHUB_USER=... GITHUB_PAT=... ./bootstrap.sh
 #   3) 交互式输入: 不传任何参数, 脚本运行后用 gum/read 提示输入
+#
+# ACR_USERNAME / ACR_PASSWORD 支持两种传入方式:
+#   1) 环境变量:   sudo ACR_USERNAME=... ACR_PASSWORD=... ./bootstrap.sh
+#   2) 交互式输入: 不传环境变量, 脚本运行后用 gum/read 提示输入
 
 set -euo pipefail  # 未定义变量报错, 管道失败传递, 命令失败由 ERR trap 统一处理并退出
 set -E             # errtrace: 让 ERR trap 传播进 step_* 函数内部
@@ -137,14 +141,16 @@ prompt_password() {
 # ============ 参数解析 ============
 GITHUB_USER="${GITHUB_USER:-}"
 GITHUB_PAT="${GITHUB_PAT:-}"
+ACR_USERNAME="${ACR_USERNAME:-}"
+ACR_PASSWORD="${ACR_PASSWORD:-}"
 RUNNER_REPO="${RUNNER_REPO:-ai-chat-demo-app}"
 
 usage() {
     cat >&2 <<EOF
 用法: sudo $0 [-u GitHub用户名] [-t GitHubToken]
   -u  GitHub 用户名 (也可用环境变量 GITHUB_USER 或交互输入)
-  -t  GitHub Personal Access Token (需 repo + write:packages + read:packages 权限)
-      repo: 注册 self-hosted runner; write:packages/read:packages: 推拉 ghcr 镜像
+  -t  GitHub Personal Access Token (需 repo 权限)
+      repo: 注册 self-hosted runner (镜像拉取走 ACR, 不再需要 packages 权限)
   -r  Self-hosted Runner 注册的目标仓库 (默认 ai-chat-demo-app, 也可用环境变量 RUNNER_REPO)
   -h  显示帮助
 EOF
@@ -201,7 +207,7 @@ step_0_collect_credentials() {
     fi
 
     if [[ -z "$GITHUB_PAT" ]]; then
-        echo "Token 需要权限: repo (注册 runner) + write:packages + read:packages (推拉 ghcr 镜像)"
+        echo "Token 需要权限: repo (注册 runner)。镜像拉取走 ACR，不再需要 packages 权限"
         while true; do
             GITHUB_PAT="$(prompt_password "请输入 GitHub Personal Access Token:")"
             [[ -n "$GITHUB_PAT" ]] && break
@@ -211,6 +217,28 @@ step_0_collect_credentials() {
         echo "已通过参数/环境变量获取 GitHub Token (隐藏显示)"
     fi
     echo "Self-hosted Runner 将注册到: ${GITHUB_USER}/${RUNNER_REPO}"
+
+    if [[ -z "$ACR_USERNAME" ]]; then
+        echo ""
+        echo "阿里云 ACR 登录凭证(用于拉取镜像):"
+        while true; do
+            ACR_USERNAME="$(prompt_input "请输入 ACR 用户名:")"
+            [[ -n "$ACR_USERNAME" ]] && break
+            echo "ACR 用户名不能为空, 请重新输入"
+        done
+    else
+        echo "已通过环境变量获取 ACR 用户名: $ACR_USERNAME"
+    fi
+
+    if [[ -z "$ACR_PASSWORD" ]]; then
+        while true; do
+            ACR_PASSWORD="$(prompt_password "请输入 ACR 密码:")"
+            [[ -n "$ACR_PASSWORD" ]] && break
+            echo "ACR 密码不能为空, 请重新输入"
+        done
+    else
+        echo "已通过环境变量获取 ACR 密码(隐藏显示)"
+    fi
 }
 
 # ============ 1. 安装 Docker ============
@@ -252,7 +280,7 @@ EOF
 }
 
 # ============ 2. 创建 compose 配置 ============
-# 生产版 compose: 拉取 ghcr 镜像, 无 build 字段
+# 生产版 compose: 拉取 ACR 镜像, 无 build 字段
 # 注意: 不创建 .env, 由 CI deploy job 从 GitHub Secrets 写入
 # 注意: 不执行 docker compose up, 缺 .env 时 Postgres 启动失败, 首次启动交由 CI
 step_2_create_compose() {
@@ -260,7 +288,7 @@ step_2_create_compose() {
     cd /opt/ts-langchain-server
 
     # EOF 不加引号: ${GITHUB_USER} 需要被 shell 展开写入镜像地址
-    # ${GITHUB_USER,,} 把用户名转小写: ghcr.io 镜像路径不允许大写字母
+    # ${GITHUB_USER,,} 把用户名转小写: ACR 命名空间即 GitHub 用户名小写
     # 端口映射 2024:8000: 容器内 LangGraph Server 监听 8000(由 langgraphjs build 生成)
     cat > docker-compose.yml << EOF
 services:
@@ -294,7 +322,7 @@ services:
     restart: unless-stopped
 
   langgraph-server:
-    image: ghcr.io/${GITHUB_USER,,}/ts-langchain-server:latest
+    image: crpi-y8mr1jotakimjtk3.cn-wulanchabu.personal.cr.aliyuncs.com/${GITHUB_USER,,}/ts-langchain-server:latest
     container_name: ts-langchain-server
     env_file: .env
     environment:
@@ -330,14 +358,14 @@ EOF
     cat docker-compose.yml
 }
 
-# ============ 3. 登录 ghcr.io ============
+# ============ 3. 登录阿里云 ACR ============
 # 仅登录, 不执行 docker compose up -d
 # .env 文件由 CI deploy job 首次部署时从 GitHub Secrets 写入
-step_3_login_ghcr() {
+step_3_login_acr() {
     cd /opt/ts-langchain-server
-    # password-stdin: 避免 token 出现在命令行参数/进程列表中
-    echo "$GITHUB_PAT" | docker login ghcr.io -u "$GITHUB_USER" --password-stdin
-    echo "ghcr.io 登录成功, 首次镜像拉取将由 CI deploy job 执行"
+    # password-stdin: 避免 password 出现在命令行参数/进程列表中
+    echo "$ACR_PASSWORD" | docker login crpi-y8mr1jotakimjtk3.cn-wulanchabu.personal.cr.aliyuncs.com -u "$ACR_USERNAME" --password-stdin
+    echo "ACR 登录成功, 首次镜像拉取将由 CI deploy job 执行"
 }
 
 # ============ 4. 配置 nginx 反向代理 ============
@@ -525,7 +553,7 @@ step_6_verify() {
 run_step "收集 GitHub 凭证"          step_0_collect_credentials
 run_step "安装 Docker"               step_1_install_docker
 run_step "创建 compose 配置"         step_2_create_compose
-run_step "登录 ghcr.io"              step_3_login_ghcr
+run_step "登录阿里云 ACR"              step_3_login_acr
 run_step "配置 nginx 反向代理"        step_4_setup_nginx
 run_step "安装注册 Self-hosted Runner"  step_5_setup_runner
 run_step "验证部署准备"              step_6_verify
