@@ -269,7 +269,7 @@ services:
     image: ghcr.io/${GITHUB_USER,,}/aui-components-mcp-server:latest
     container_name: aui-components-mcp-server
     ports:
-      - "127.0.0.1:3001:3001"
+      - "127.0.0.1:3002:3001"
     networks:
       - default
       - app-network
@@ -320,7 +320,7 @@ server {
     proxy_cache off;
 
     location / {
-        proxy_pass http://127.0.0.1:3001;
+        proxy_pass http://127.0.0.1:3002;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
