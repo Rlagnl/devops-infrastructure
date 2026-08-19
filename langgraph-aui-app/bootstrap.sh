@@ -319,7 +319,9 @@ server {
     location / {
         proxy_pass http://127.0.0.1:3001;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        # 用 $http_host 保留客户端原始 Host(含端口, 如 8.130.30.183:8080),
+        # 避免 Next.js Server Actions 校验 x-forwarded-host 与 origin 不匹配
+        proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
