@@ -304,6 +304,8 @@ services:
     environment:
       POSTGRES_URI: postgres://langgraph:\${POSTGRES_PASSWORD}@postgres:5432/langgraph
       REDIS_URI: redis://redis:6379
+      # 生产固定输出 JSON 日志(structlog), 与本地开发 ConsoleRenderer 区分
+      LOG_FORMAT: json
     ports:
       - "127.0.0.1:2025:8000"
     depends_on:

@@ -282,7 +282,7 @@ step_2_create_compose() {
     # ${GITHUB_USER,,} 把用户名转小写: ACR 命名空间即 GitHub 用户名小写
     cat > docker-compose.yml << EOF
 services:
-  aui-docs:
+  aui-components-doc:
     image: ghcr.io/${GITHUB_USER,,}/aui-components-doc:latest
     container_name: aui-components-doc
     ports:
@@ -318,11 +318,52 @@ step_4_setup_nginx() {
     systemctl enable nginx
     systemctl start nginx
 
+    # JSON 访问日志格式: log_format/map 必须在 http 上下文, 写入 conf.d(被 nginx.conf include)
+    # map: 状态码 → 日志级别(2xx/3xx→info, 4xx→warn, 5xx→error)
+    # duration_ms 使用 $request_time(秒, 毫秒精度), nginx 原生无法在 log_format 内乘 1000
+    # 使用项目前缀命名避免同机多项目(如 langgraph-aui-app)的 log_format/map 变量冲突
+    tee /etc/nginx/conf.d/aui-components-doc-log-format.conf > /dev/null <<'NGINX_CONF'
+map $status $aui_components_doc_log_level {
+    ~^[23]  info;
+    ~^4     warn;
+    ~^5     error;
+    default info;
+}
+
+log_format aui_components_doc_json escape=json '{"timestamp":"$time_iso8601","level":"$aui_components_doc_log_level","service":"aui-components-doc","message":"$request_method $uri $status","event":"http_request","trace_id":"$request_id","http":{"method":"$request_method","uri":"$uri","status":$status},"duration_ms":$request_time,"user_agent":"$http_user_agent"}';
+NGINX_CONF
+
     # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开
     tee /etc/nginx/sites-available/aui-components-doc > /dev/null <<'NGINX'
 server {
     listen 8082;
     server_name _;
+
+    # JSON 访问日志(格式定义见 conf.d/aui-components-doc-log-format.conf)
+    access_log /var/log/nginx/aui-components-doc-access.log aui_components_doc_json;
+
+    # Next.js 静态导出资源不记访问日志, 排除噪音
+    location /_next/static/ {
+        access_log off;
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 图片/字体等静态资源不记访问日志
+    location ~* \.(png|jpg|jpeg|gif|ico|svg|webp|woff2?|ttf|eot)$ {
+        access_log off;
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;

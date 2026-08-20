@@ -304,6 +304,21 @@ step_4_setup_nginx() {
     systemctl enable nginx
     systemctl start nginx
 
+    # JSON 访问日志格式: log_format/map 必须在 http 上下文, 写入 conf.d(被 nginx.conf include)
+    # map: 状态码 → 日志级别(2xx/3xx→info, 4xx→warn, 5xx→error)
+    # duration_ms 使用 $request_time(秒, 毫秒精度), nginx 原生无法在 log_format 内乘 1000
+    # 使用项目前缀命名避免同机多项目(如 aui-components-doc)的 log_format/map 变量冲突
+    tee /etc/nginx/conf.d/langgraph-aui-app-log-format.conf > /dev/null <<'NGINX_CONF'
+map $status $langgraph_aui_app_log_level {
+    ~^[23]  info;
+    ~^4     warn;
+    ~^5     error;
+    default info;
+}
+
+log_format langgraph_aui_app_json escape=json '{"timestamp":"$time_iso8601","level":"$langgraph_aui_app_log_level","service":"langgraph-aui-app","message":"$request_method $uri $status","event":"http_request","trace_id":"$request_id","http":{"method":"$request_method","uri":"$uri","status":$status},"duration_ms":$request_time,"user_agent":"$http_user_agent"}';
+NGINX_CONF
+
     # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开
     # proxy_buffering off + proxy_cache off: 支持 SSE 流式响应(LangGraph stream 端点)
     # proxy_read_timeout 86400s: SSE 长连接超时设为 24 小时
@@ -312,9 +327,34 @@ server {
     listen 8080;
     server_name _;
 
+    # JSON 访问日志(格式定义见 conf.d/langgraph-aui-app-log-format.conf)
+    access_log /var/log/nginx/langgraph-aui-app-access.log langgraph_aui_app_json;
+
     # 关闭缓冲, 支持 SSE 流式响应
     proxy_buffering off;
     proxy_cache off;
+
+    # Next.js 框架静态资源不记访问日志, 排除噪音
+    location /_next/static/ {
+        access_log off;
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 图片/字体等静态资源不记访问日志
+    location ~* \.(png|jpg|jpeg|gif|ico|svg|webp|woff2?|ttf|eot)$ {
+        access_log off;
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:3001;
@@ -325,6 +365,9 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 透传 request_id 给应用, 应用侧 createHttpLogger 取同源 trace_id
+        proxy_set_header X-Request-Id $request_id;
 
         # SSE 长连接支持
         proxy_set_header Upgrade $http_upgrade;
