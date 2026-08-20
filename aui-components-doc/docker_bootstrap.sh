@@ -305,7 +305,12 @@ step_3_login_and_start() {
     # password-stdin: 避免 token 出现在命令行参数/进程列表(/proc/<pid>/cmdline)中
     echo "$GITHUB_PAT" | docker login ghcr.io -u "$GITHUB_USER" --password-stdin
     docker compose pull
-    docker compose up -d
+    # 清理残留的同名容器：显式 container_name 与旧容器（可能因 service 更名成为孤儿）重名时，
+    # docker compose up 会报 "Conflict. The container name is already in use"。
+    # 强制移除后重建（静态文档无状态，可安全幂等重建）。
+    docker rm -f aui-components-doc >/dev/null 2>&1 || true
+    # --remove-orphans: 一并清理不属于当前 compose 文件的孤儿容器
+    docker compose up -d --remove-orphans
 }
 
 # ============ 4. 配置 nginx 反向代理 ============
