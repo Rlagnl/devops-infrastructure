@@ -328,7 +328,7 @@ server {
     server_name _;
 
     # JSON 访问日志(格式定义见 conf.d/langgraph-aui-app-log-format.conf)
-    access_log /var/log/nginx/langgraph-aui-app-access.log langgraph_aui_app_json;
+    access_log /var/log/nginx/access.log langgraph_aui_app_json;
 
     # 关闭缓冲, 支持 SSE 流式响应
     proxy_buffering off;

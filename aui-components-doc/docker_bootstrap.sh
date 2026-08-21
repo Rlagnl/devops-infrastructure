@@ -345,7 +345,7 @@ server {
     server_name _;
 
     # JSON 访问日志(格式定义见 conf.d/aui-components-doc-log-format.conf)
-    access_log /var/log/nginx/aui-components-doc-access.log aui_components_doc_json;
+    access_log /var/log/nginx/access.log aui_components_doc_json;
 
     # Next.js 静态导出资源不记访问日志, 排除噪音
     location /_next/static/ {
