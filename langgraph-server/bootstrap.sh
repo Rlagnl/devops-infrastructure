@@ -356,6 +356,20 @@ step_4_setup_nginx() {
     systemctl enable nginx
     systemctl start nginx
 
+    # JSON 访问日志格式: log_format/map 必须在 http 上下文, 写入 conf.d(被 nginx.conf include)
+    # map: 状态码 → 日志级别(2xx/3xx→info, 4xx→warn, 5xx→error)
+    # 使用项目前缀命名避免同机多项目(如 langgraph-aui-app)的 log_format/map 变量冲突
+    tee /etc/nginx/conf.d/langgraph-server-log-format.conf > /dev/null <<'NGINX_CONF'
+map $status $langgraph_server_log_level {
+    ~^[23]  info;
+    ~^4     warn;
+    ~^5     error;
+    default info;
+}
+
+log_format langgraph_server_json escape=json '{"timestamp":"$time_iso8601","level":"$langgraph_server_log_level","service":"langgraph-server","message":"$request_method $uri $status","event":"http_request","trace_id":"$request_id","http":{"method":"$request_method","uri":"$uri","status":$status},"duration_ms":$request_time,"user_agent":"$http_user_agent"}';
+NGINX_CONF
+
     # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开
     # proxy_buffering off + proxy_cache off: 支持 SSE 流式响应(LangGraph stream 端点)
     # proxy_read_timeout 86400s: SSE 长连接超时设为 24 小时
@@ -363,6 +377,9 @@ step_4_setup_nginx() {
 server {
     listen 8084;
     server_name _;
+
+    # JSON 访问日志(格式定义见 conf.d/langgraph-server-log-format.conf)
+    access_log /var/log/nginx/access.log langgraph_server_json;
 
     # 关闭缓冲, 支持 SSE 流式响应
     proxy_buffering off;
@@ -376,6 +393,9 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
+        # 透传 request_id 给应用, 应用侧可关联同源 trace_id
+        proxy_set_header X-Request-Id $request_id;
+
         # SSE 长连接支持
         proxy_set_header Connection "";
         proxy_read_timeout 86400s;
@@ -388,6 +408,23 @@ NGINX
     ln -sf /etc/nginx/sites-available/langgraph-server /etc/nginx/sites-enabled/langgraph-server
     nginx -t
     systemctl reload nginx
+
+    # logrotate: 自定义 access_log 文件名无系统默认轮转, 需单独配置防止日志无限增长占满磁盘
+    tee /etc/logrotate.d/langgraph-server > /dev/null <<'LOGROTATE'
+/var/log/nginx/langgraph-server-access.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 640 www-data adm
+    sharedscripts
+    postrotate
+        [ -s /run/nginx.pid ] && kill -USR1 `cat /run/nginx.pid`
+    endscript
+}
+LOGROTATE
 }
 
 # ============ 5. 安装注册 Self-hosted Runner ============
