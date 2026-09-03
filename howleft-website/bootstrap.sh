@@ -313,7 +313,10 @@ step_5_setup_runner() {
     # CI 的 deploy job 以 github-runner 用户运行, 需要能 rsync 到 webroot
     chown -R github-runner:github-runner "$NGINX_ROOT"
 
-    local runner_dir="/home/github-runner/actions-runner"
+    # 每个仓库使用独立的 runner 目录, 避免与服务器上已有的其他仓库 runner 冲突:
+    # 若共用 /home/github-runner/actions-runner, 其他仓库的 config.sh/.runner 会让幂等检查误判,
+    # 导致 howleft 的 runner 实际没注册却被跳过注册.
+    local runner_dir="/home/github-runner/actions-runner-${RUNNER_REPO}"
     # 幂等: 已存在 config.sh 则跳过下载(支持脚本重复执行)
     if [[ ! -f "$runner_dir/config.sh" ]]; then
         mkdir -p "$runner_dir"
