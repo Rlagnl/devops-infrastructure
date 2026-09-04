@@ -224,19 +224,44 @@ step_1_install_base_tools() {
     apt-get install -y -qq git rsync jq curl
 }
 
-# ============ 2. 安装 Node 22 ============
+# ============ 2. 复用现有 Node 22 ============
 step_2_install_node() {
-    # 幂等: Node 22 已可用则跳过
-    if command -v node >/dev/null 2>&1 && node -v 2>/dev/null | grep -q '^v22'; then
-        echo "Node 22 已安装, 跳过"
+    # root 的家目录(脚本以 root 运行, nvm 默认装在 root 的 home; 用 getent 而非 $HOME, 避免 sudo 环境差异)
+    local root_home
+    root_home="$(getent passwd root | cut -d: -f6)"
+    [[ -n "$root_home" ]] || root_home="/root"
+
+    # 优先扫描 nvm 安装的 v22 版本(不依赖当前 PATH)
+    local node_dir
+    node_dir="$(ls -d "$root_home/.nvm/versions/node"/v22.* 2>/dev/null | sort -V | tail -n 1)"
+
+    # 扫描不到时, 再从当前 PATH 里的 node 反推真实位置
+    if [[ -z "$node_dir" ]] && command -v node >/dev/null 2>&1; then
+        local node_real
+        node_real="$(readlink -f "$(command -v node)")"
+        [[ -n "$node_real" && -x "$node_real" ]] && node_dir="$(dirname "$(dirname "$node_real")")"
+    fi
+
+    # 确实没有 node 时, 才回退到系统级安装
+    if [[ -z "$node_dir" || ! -x "$node_dir/bin/node" ]]; then
+        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+        apt-get install -y -qq nodejs
         return 0
     fi
 
-    # 用 NodeSource 官方源装系统级 Node(装到 /usr/bin, 所有用户可访问).
-    # 不能用 nvm: nvm 把 node 装到 /root/.nvm(权限 700), 即使 symlink 到 /usr/local/bin,
-    # github-runner 用户也会因无法访问 /root 而执行失败(command not found).
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-    apt-get install -y -qq nodejs
+    # 把整个版本目录复制到系统级位置(所有用户可读), 让 github-runner 能访问.
+    # 必须整目录复制: bin/node 只是入口, npm 依赖同级的 lib/node_modules/npm.
+    local dest="/usr/local/lib/nodejs/$(basename "$node_dir")"
+    if [[ ! -d "$dest" ]]; then
+        mkdir -p /usr/local/lib/nodejs
+        cp -a "$node_dir" "$dest"
+    fi
+
+    # 覆盖旧的指向 /root/.nvm 的 symlink, 指向系统级副本
+    ln -sf "$dest/bin/node" /usr/local/bin/node
+    ln -sf "$dest/bin/npm"  /usr/local/bin/npm
+    ln -sf "$dest/bin/npx"  /usr/local/bin/npx
+    echo "已复用现有 Node 22 并暴露到系统级路径: $dest"
 }
 
 # ============ 3. 安装 pnpm ============
