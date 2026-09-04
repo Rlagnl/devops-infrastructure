@@ -139,8 +139,11 @@ prompt_password() {
 GITHUB_USER="${GITHUB_USER:-}"
 GITHUB_PAT="${GITHUB_PAT:-}"
 RUNNER_REPO="${RUNNER_REPO:-howleft}"    # Self-hosted Runner 注册的目标仓库
-WEB_PORT="${WEB_PORT:-8085}"             # nginx 对外监听端口
+WEB_PORT="${WEB_PORT:-80}"               # nginx 对外监听端口(HTTP 端口, HTTPS 由 certbot 追加 443)
 NGINX_ROOT="${NGINX_ROOT:-/opt/howleft}" # nginx 静态站点根目录
+SERVER_NAME="${SERVER_NAME:-howleft.rlagnl.top}" # 对外域名
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-250989770@qq.com}" # Let's Encrypt 通知邮箱(证书过期提醒)
+ENABLE_HTTPS="${ENABLE_HTTPS:-1}"        # 是否启用 HTTPS(1 启用, 0 跳过)
 
 usage() {
     cat >&2 <<EOF
@@ -148,7 +151,7 @@ usage() {
   -u  GitHub 用户名 (也可用环境变量 GITHUB_USER 或交互输入)
   -t  GitHub Personal Access Token (需 repo 权限, 用于注册 self-hosted runner)
   -r  Self-hosted Runner 注册的目标仓库 (默认 howleft, 也可用环境变量 RUNNER_REPO)
-  -p  nginx 监听端口 (默认 8085, 也可用环境变量 WEB_PORT)
+  -p  nginx 监听端口 (默认 80, 也可用环境变量 WEB_PORT)
   -h  显示帮助
 EOF
     exit 1
@@ -237,12 +240,13 @@ step_2_setup_nginx() {
     # 先建 webroot, 避免 nginx 启动时 root 目录不存在
     mkdir -p "$NGINX_ROOT"
 
-    # heredoc 不加引号: ${WEB_PORT} / ${NGINX_ROOT} 需被 shell 展开;
+    # heredoc 不加引号: ${WEB_PORT} / ${NGINX_ROOT} / ${SERVER_NAME} 需被 shell 展开;
     # nginx 自身的 $uri 变量用 \$ 转义, 避免被 shell 当变量展开
     tee /etc/nginx/sites-available/howleft-website > /dev/null <<EOF
 server {
     listen ${WEB_PORT};
-    server_name _;
+    listen [::]:${WEB_PORT};
+    server_name ${SERVER_NAME};
 
     root ${NGINX_ROOT};
     index index.html;
@@ -255,6 +259,47 @@ EOF
     # 移除默认站点(避免 80 端口显示 "Welcome to nginx")
     rm -f /etc/nginx/sites-enabled/default
     ln -sf /etc/nginx/sites-available/howleft-website /etc/nginx/sites-enabled/howleft-website
+    nginx -t
+    systemctl reload nginx
+}
+
+# ============ 5. 配置 HTTPS (Let's Encrypt) ============
+step_5_setup_https() {
+    # 可通过 ENABLE_HTTPS=0 显式关闭(例如域名尚未解析到本机时)
+    if [[ "${ENABLE_HTTPS:-1}" != "1" ]]; then
+        echo "已设置 ENABLE_HTTPS=0, 跳过 HTTPS 配置"
+        return 0
+    fi
+
+    # 幂等: 证书已签发则跳过, 仅尝试续期
+    if [[ -d "/etc/letsencrypt/live/${SERVER_NAME}" ]]; then
+        echo "证书已存在: /etc/letsencrypt/live/${SERVER_NAME}, 跳过签发"
+        certbot renew --nginx --quiet || true
+        return 0
+    fi
+
+    # 收集 Let's Encrypt 通知邮箱(用于证书过期提醒)
+    if [[ -z "$CERTBOT_EMAIL" ]]; then
+        CERTBOT_EMAIL="$(prompt_input "请输入 Let's Encrypt 通知邮箱:")"
+    fi
+    if [[ -z "$CERTBOT_EMAIL" ]]; then
+        echo "警告: 未提供邮箱, 跳过 HTTPS 配置(可用环境变量 CERTBOT_EMAIL 传入后重跑)"
+        return 0
+    fi
+
+    # 安装 certbot 及其 nginx 插件
+    if ! command -v certbot >/dev/null 2>&1; then
+        apt-get update -qq
+        apt-get install -y -qq certbot python3-certbot-nginx
+    fi
+
+    echo "签发证书并改写 nginx 配置(HTTP 自动跳转 HTTPS)..."
+    # --nginx: 自动定位 server_name 对应的 server 块; --redirect: 追加 80->443 跳转
+    certbot --nginx -d "$SERVER_NAME" \
+        --non-interactive --agree-tos --redirect \
+        -m "$CERTBOT_EMAIL" \
+        --keep-until-expiring
+
     nginx -t
     systemctl reload nginx
 }
@@ -383,22 +428,22 @@ step_4_verify() {
     echo "1. 确认仓库 Settings > Actions > Runners 里出现带 production 标签的 runner"
     echo "2. 确认仓库 Settings > Actions > General 的 Workflow permissions 设为 Read and write"
     echo "3. push 到 develop 分支触发 CI(或手动 workflow_dispatch)"
-    echo "4. 部署完成后访问: http://<服务器IP>:${WEB_PORT}"
+    echo "4. 部署完成后访问: https://${SERVER_NAME}"
 }
 
 # ============ 执行所有步骤 ============
 run_step "收集 GitHub 凭证"           step_0_collect_credentials
 run_step "安装基础工具"               step_1_install_base_tools
 run_step "配置 nginx 静态站点"        step_2_setup_nginx
+run_step "配置 HTTPS 证书"            step_5_setup_https
 run_step "安装注册 Self-hosted Runner" step_3_setup_runner
 run_step "验证部署准备"               step_4_verify
 
-SERVER_IP="$(curl -s ifconfig.me 2>/dev/null || echo "<服务器IP>")"
 printf '\n%s========================================%s\n' "$GREEN" "$NC"
 printf '%s服务器初始化完成!%s\n' "$GREEN" "$NC"
 printf 'webroot: %s\n' "$NGINX_ROOT"
-printf 'nginx 端口: %s\n' "$WEB_PORT"
+printf '访问域名: %s\n' "$SERVER_NAME"
 printf 'runner 目标仓库: %s\n' "${GITHUB_USER}/${RUNNER_REPO}"
 printf '\n下一步: 确认 runner 上线后, push 到 develop 触发部署\n'
-printf '部署完成后访问: http://%s:%s\n' "$SERVER_IP" "$WEB_PORT"
+printf '部署完成后访问: https://%s\n' "$SERVER_NAME"
 printf '%s========================================%s\n' "$GREEN" "$NC"
