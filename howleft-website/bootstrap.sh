@@ -264,22 +264,26 @@ step_2_install_node() {
     echo "已复用现有 Node 22 并暴露到系统级路径: $dest"
 }
 
-# ============ 3. 安装 pnpm ============
+# ============ 3. 安装 pnpm 与 nrm(切换 npm 源) ============
 step_3_install_pnpm() {
     # 系统级 node 副本的 bin 目录(npm 真实路径的上级目录)
     local node_bin
     node_bin="$(dirname "$(readlink -f "$(command -v npm)")")"
 
-    # 幂等: pnpm 已装到该目录则只重建 symlink
-    if [[ -x "$node_bin/pnpm" ]]; then
-        ln -sf "$node_bin/pnpm" /usr/local/bin/pnpm
-        echo "pnpm 已安装, 跳过"
-        return 0
+    # 1) pnpm: 幂等安装并 symlink 到 /usr/local/bin
+    if [[ ! -x "$node_bin/pnpm" ]]; then
+        # 与仓库 .github/workflows 中 pnpm/action-setup 使用的版本保持一致
+        npm install -g pnpm@10.32.1
     fi
-
-    # 与仓库 .github/workflows 中 pnpm/action-setup 使用的版本保持一致
-    npm install -g pnpm@10.32.1
     ln -sf "$node_bin/pnpm" /usr/local/bin/pnpm
+
+    # 2) nrm: 幂等安装并 symlink, 切换到 npmmirror 源(国内加速, 覆盖 root 等场景)
+    #    nrm 内置源名是 taobao, 其 URL 已指向 https://registry.npmmirror.com/
+    if [[ ! -x "$node_bin/nrm" ]]; then
+        npm install -g nrm
+    fi
+    ln -sf "$node_bin/nrm" /usr/local/bin/nrm
+    nrm use taobao
 }
 
 # ============ 4. 配置 nginx 静态站点 ============
@@ -327,9 +331,10 @@ step_5_setup_runner() {
         useradd -m -s /bin/bash github-runner
     fi
 
-    # 为 github-runner 配置 npmmirror 源, 避免 CI 里 pnpm install 走 npm 官方源(国内慢/超时)
-    echo "registry=https://registry.npmmirror.com" > /home/github-runner/.npmrc
-    chown github-runner:github-runner /home/github-runner/.npmrc
+    # 为 github-runner 配置 npmmirror 源(用 nrm 切换, 与 step_3 保持一致),
+    # 避免 CI 里 pnpm install 走 npm 官方源(国内慢/超时)
+    # -H 让 sudo 把 HOME 设为 github-runner 的家目录, 使 nrm 写入 /home/github-runner/.npmrc
+    sudo -u github-runner -H nrm use taobao
 
     # CI 的 deploy job 以 github-runner 用户运行, 需要能 rsync 到 webroot
     chown -R github-runner:github-runner "$NGINX_ROOT"
