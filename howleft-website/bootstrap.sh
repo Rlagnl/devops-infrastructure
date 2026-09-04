@@ -226,43 +226,35 @@ step_1_install_base_tools() {
 
 # ============ 2. 安装 Node 22 ============
 step_2_install_node() {
-    export NVM_DIR="$HOME/.nvm"
-    if [ -s "$NVM_DIR/nvm.sh" ]; then
-        \. "$NVM_DIR/nvm.sh"
-    fi
-
     # 幂等: Node 22 已可用则跳过
     if command -v node >/dev/null 2>&1 && node -v 2>/dev/null | grep -q '^v22'; then
         echo "Node 22 已安装, 跳过"
         return 0
     fi
 
-    # 安装 nvm(直连 GitHub, 国内服务器可先配置好代理或镜像)
-    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-    export NVM_DIR="$HOME/.nvm"
-    [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-
-    nvm install 22
-    nvm use 22
-    nvm alias default 22
-
-    # nvm 管理的 node/npm 只在 nvm 的 PATH 里, 非交互 shell(如 runner 的 CI 进程)不会加载 nvm.
-    # 创建 symlink 到 /usr/local/bin, 让所有用户和 runner 都能直接使用.
-    ln -sf "$(command -v node)" /usr/local/bin/node
-    ln -sf "$(command -v npm)"  /usr/local/bin/npm
+    # 用 NodeSource 官方源装系统级 Node(装到 /usr/bin, 所有用户可访问).
+    # 不能用 nvm: nvm 把 node 装到 /root/.nvm(权限 700), 即使 symlink 到 /usr/local/bin,
+    # github-runner 用户也会因无法访问 /root 而执行失败(command not found).
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+    apt-get install -y -qq nodejs
 }
 
 # ============ 3. 安装 pnpm ============
 step_3_install_pnpm() {
-    # 幂等: 已安装则跳过
-    if command -v pnpm >/dev/null 2>&1; then
+    # 系统级 node 副本的 bin 目录(npm 真实路径的上级目录)
+    local node_bin
+    node_bin="$(dirname "$(readlink -f "$(command -v npm)")")"
+
+    # 幂等: pnpm 已装到该目录则只重建 symlink
+    if [[ -x "$node_bin/pnpm" ]]; then
+        ln -sf "$node_bin/pnpm" /usr/local/bin/pnpm
         echo "pnpm 已安装, 跳过"
         return 0
     fi
 
     # 与仓库 .github/workflows 中 pnpm/action-setup 使用的版本保持一致
     npm install -g pnpm@10.32.1
-    ln -sf "$(command -v pnpm)" /usr/local/bin/pnpm
+    ln -sf "$node_bin/pnpm" /usr/local/bin/pnpm
 }
 
 # ============ 4. 配置 nginx 静态站点 ============
