@@ -4,9 +4,9 @@
 #
 # 职责(在目标服务器上以 root 运行一次):
 #   1. 安装基础工具: git / rsync / jq / curl
-#   2. 安装 Node 22 与 pnpm(供 Self-hosted Runner 上执行 build)
-#   3. 配置 nginx 静态站点: root ${NGINX_ROOT}(默认 /opt/howleft), 监听 ${WEB_PORT}(默认 8085)
-#   4. 安装并注册 Self-hosted Runner(label: production, 目标仓库 Rlagnl/howleft)
+#   2. 配置 nginx 静态站点: root ${NGINX_ROOT}(默认 /opt/howleft), 监听 ${WEB_PORT}(默认 8085)
+#   3. 安装并注册 Self-hosted Runner(label: production, 目标仓库 Rlagnl/howleft)
+# 说明: 静态产物在 GitHub 托管 runner 上构建, 本脚本无需安装 Node/pnpm/nrm
 #
 # GITHUB_USER / GITHUB_PAT 支持三种传入方式:
 #   1) 命令行参数: sudo ./bootstrap.sh -u <user> -t <token>
@@ -220,74 +220,12 @@ step_0_collect_credentials() {
 # ============ 1. 安装基础工具 ============
 step_1_install_base_tools() {
     apt-get update -qq
-    # git: runner checkout 需要; rsync: CI 同步静态产物; jq: 解析 runner registration token; curl: 下载 nvm/runner
+    # rsync: deploy job 同步静态产物到 webroot; jq: 解析 runner registration token; curl: 下载 runner; git: 通用依赖
     apt-get install -y -qq git rsync jq curl
 }
 
-# ============ 2. 复用现有 Node 22 ============
-step_2_install_node() {
-    # root 的家目录(脚本以 root 运行, nvm 默认装在 root 的 home; 用 getent 而非 $HOME, 避免 sudo 环境差异)
-    local root_home
-    root_home="$(getent passwd root | cut -d: -f6)"
-    [[ -n "$root_home" ]] || root_home="/root"
-
-    # 优先扫描 nvm 安装的 v22 版本(不依赖当前 PATH)
-    local node_dir
-    node_dir="$(ls -d "$root_home/.nvm/versions/node"/v22.* 2>/dev/null | sort -V | tail -n 1)"
-
-    # 扫描不到时, 再从当前 PATH 里的 node 反推真实位置
-    if [[ -z "$node_dir" ]] && command -v node >/dev/null 2>&1; then
-        local node_real
-        node_real="$(readlink -f "$(command -v node)")"
-        [[ -n "$node_real" && -x "$node_real" ]] && node_dir="$(dirname "$(dirname "$node_real")")"
-    fi
-
-    # 确实没有 node 时, 才回退到系统级安装
-    if [[ -z "$node_dir" || ! -x "$node_dir/bin/node" ]]; then
-        curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-        apt-get install -y -qq nodejs
-        return 0
-    fi
-
-    # 把整个版本目录复制到系统级位置(所有用户可读), 让 github-runner 能访问.
-    # 必须整目录复制: bin/node 只是入口, npm 依赖同级的 lib/node_modules/npm.
-    local dest="/usr/local/lib/nodejs/$(basename "$node_dir")"
-    if [[ ! -d "$dest" ]]; then
-        mkdir -p /usr/local/lib/nodejs
-        cp -a "$node_dir" "$dest"
-    fi
-
-    # 覆盖旧的指向 /root/.nvm 的 symlink, 指向系统级副本
-    ln -sf "$dest/bin/node" /usr/local/bin/node
-    ln -sf "$dest/bin/npm"  /usr/local/bin/npm
-    ln -sf "$dest/bin/npx"  /usr/local/bin/npx
-    echo "已复用现有 Node 22 并暴露到系统级路径: $dest"
-}
-
-# ============ 3. 安装 pnpm 与 nrm(切换 npm 源) ============
-step_3_install_pnpm() {
-    # 系统级 node 副本的 bin 目录(npm 真实路径的上级目录)
-    local node_bin
-    node_bin="$(dirname "$(readlink -f "$(command -v npm)")")"
-
-    # 1) pnpm: 幂等安装并 symlink 到 /usr/local/bin
-    if [[ ! -x "$node_bin/pnpm" ]]; then
-        # 与仓库 .github/workflows 中 pnpm/action-setup 使用的版本保持一致
-        npm install -g pnpm@10.32.1
-    fi
-    ln -sf "$node_bin/pnpm" /usr/local/bin/pnpm
-
-    # 2) nrm: 幂等安装并 symlink, 切换到 npmmirror 源(国内加速, 覆盖 root 等场景)
-    #    nrm 内置源名是 taobao, 其 URL 已指向 https://registry.npmmirror.com/
-    if [[ ! -x "$node_bin/nrm" ]]; then
-        npm install -g nrm
-    fi
-    ln -sf "$node_bin/nrm" /usr/local/bin/nrm
-    nrm use taobao
-}
-
-# ============ 4. 配置 nginx 静态站点 ============
-step_4_setup_nginx() {
+# ============ 2. 配置 nginx 静态站点 ============
+step_2_setup_nginx() {
     # 幂等: 未安装才安装
     if ! command -v nginx >/dev/null 2>&1; then
         apt-get update -qq
@@ -321,8 +259,8 @@ EOF
     systemctl reload nginx
 }
 
-# ============ 5. 安装注册 Self-hosted Runner ============
-step_5_setup_runner() {
+# ============ 3. 安装注册 Self-hosted Runner ============
+step_3_setup_runner() {
     echo "确保 jq 已安装(解析 GitHub API 返回的 JSON)..."
     command -v jq >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq jq; }
 
@@ -330,11 +268,6 @@ step_5_setup_runner() {
     if ! id github-runner >/dev/null 2>&1; then
         useradd -m -s /bin/bash github-runner
     fi
-
-    # 为 github-runner 配置 npmmirror 源(用 nrm 切换, 与 step_3 保持一致),
-    # 避免 CI 里 pnpm install 走 npm 官方源(国内慢/超时)
-    # -H 让 sudo 把 HOME 设为 github-runner 的家目录, 使 nrm 写入 /home/github-runner/.npmrc
-    sudo -u github-runner -H nrm use taobao
 
     # CI 的 deploy job 以 github-runner 用户运行, 需要能 rsync 到 webroot
     chown -R github-runner:github-runner "$NGINX_ROOT"
@@ -425,8 +358,8 @@ step_5_setup_runner() {
     ./svc.sh status 2>/dev/null || systemctl status 'actions.runner.*' --no-pager || true
 }
 
-# ============ 6. 验证部署准备 ============
-step_6_verify() {
+# ============ 4. 验证部署准备 ============
+step_4_verify() {
     echo "=== 基础设施验证 ==="
 
     if [[ -d "$NGINX_ROOT" ]]; then
@@ -456,11 +389,9 @@ step_6_verify() {
 # ============ 执行所有步骤 ============
 run_step "收集 GitHub 凭证"           step_0_collect_credentials
 run_step "安装基础工具"               step_1_install_base_tools
-run_step "安装 Node 22"              step_2_install_node
-run_step "安装 pnpm"                 step_3_install_pnpm
-run_step "配置 nginx 静态站点"        step_4_setup_nginx
-run_step "安装注册 Self-hosted Runner" step_5_setup_runner
-run_step "验证部署准备"               step_6_verify
+run_step "配置 nginx 静态站点"        step_2_setup_nginx
+run_step "安装注册 Self-hosted Runner" step_3_setup_runner
+run_step "验证部署准备"               step_4_verify
 
 SERVER_IP="$(curl -s ifconfig.me 2>/dev/null || echo "<服务器IP>")"
 printf '\n%s========================================%s\n' "$GREEN" "$NC"
