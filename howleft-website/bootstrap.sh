@@ -327,6 +327,10 @@ step_5_setup_runner() {
         useradd -m -s /bin/bash github-runner
     fi
 
+    # 为 github-runner 配置 npmmirror 源, 避免 CI 里 pnpm install 走 npm 官方源(国内慢/超时)
+    echo "registry=https://registry.npmmirror.com" > /home/github-runner/.npmrc
+    chown github-runner:github-runner /home/github-runner/.npmrc
+
     # CI 的 deploy job 以 github-runner 用户运行, 需要能 rsync 到 webroot
     chown -R github-runner:github-runner "$NGINX_ROOT"
 
