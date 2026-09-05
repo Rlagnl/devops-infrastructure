@@ -353,8 +353,10 @@ NGINX
 }
 
 # ============ 5. 配置 HTTPS (Let's Encrypt HTTP-01) ============
-# 用 certbot --nginx(HTTP-01)自动签发 + 改写 nginx: server 块仅单个 location, 插件可正确处理
-# 与 howleft-website 一致; langgraph-aui-app 因 server 块含正则/多个 location 才改走 DNS-01
+# 用 certbot certonly --nginx(HTTP-01)只签发证书, 再手动写 80/443 配置
+# 不用 certbot --nginx 自动改写: 服务器上已存在 doc.aui.rlagnl.top 等其它站点,
+#   certbot --nginx 自动改写会因多站点/复杂 server 块导致 mcp 的 443 server 块缺失,
+#   使浏览器请求落到其它站点的 default server(表现为"证书来自 doc.aui.rlagnl.top")
 step_5_setup_https() {
     # 可通过 ENABLE_HTTPS=0 显式关闭(例如域名尚未解析到本机时)
     if [[ "${ENABLE_HTTPS:-1}" != "1" ]]; then
@@ -365,23 +367,62 @@ step_5_setup_https() {
     # 幂等: 证书已签发则跳过, 仅尝试续期
     if [[ -d "/etc/letsencrypt/live/${SERVER_NAME}" ]]; then
         echo "证书已存在: /etc/letsencrypt/live/${SERVER_NAME}, 跳过签发"
-        certbot renew --nginx --quiet || true
+        certbot renew --quiet || true
         systemctl reload nginx || true
         return 0
     fi
 
-    # 安装 certbot 及其 nginx 插件
+    # 安装 certbot 及其 nginx 插件(certonly --nginx 需要 nginx 插件)
     if ! command -v certbot >/dev/null 2>&1; then
         apt-get update -qq
         apt-get install -y -qq certbot python3-certbot-nginx
     fi
 
-    echo "通过 HTTP-01 验证签发证书并改写 nginx(80 -> 443 自动跳转)..."
-    # --nginx: 自动定位 server_name 对应的 server 块并注入 SSL; --redirect: 追加 80->443 跳转
-    certbot --nginx -d "$SERVER_NAME" \
-        --non-interactive --agree-tos --redirect \
+    echo "通过 HTTP-01 验证签发证书(仅签发, 不自动改写 nginx)..."
+    # certonly --nginx: HTTP-01 验证, 只签发证书, 不改写 nginx 配置
+    certbot certonly --nginx -d "$SERVER_NAME" \
+        --non-interactive --agree-tos \
         -m "$CERTBOT_EMAIL" \
         --keep-until-expiring
+
+    # 证书签出后手动生成 80(301 跳转) + 443(SSL 终结) 站点配置
+    # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开; __DOMAIN__ 由 sed 替换
+    tee /etc/nginx/sites-available/aui-components-mcp-server > /dev/null <<'NGINX'
+# HTTP → HTTPS 跳转
+server {
+    listen 80;
+    server_name __DOMAIN__;
+    return 301 https://$host$request_uri;
+}
+
+# HTTPS 服务
+server {
+    listen 443 ssl;
+    server_name __DOMAIN__;
+
+    ssl_certificate /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
+
+    # 关闭缓冲, 支持 SSE 流式响应
+    proxy_buffering off;
+    proxy_cache off;
+
+    location / {
+        proxy_pass http://127.0.0.1:3002;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # SSE 长连接支持
+        proxy_set_header Connection "";
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}
+NGINX
+    sed -i "s/__DOMAIN__/${SERVER_NAME}/g" /etc/nginx/sites-available/aui-components-mcp-server
 
     nginx -t
     systemctl reload nginx
