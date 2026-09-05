@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Docker 部署引导脚本: 安装 Docker, 创建 compose 配置, 登录 ACR, 配置 nginx, 安装注册 Self-hosted Runner
-# 参考 packages/devops-infrastructure/ts-langchain-server/bootstrap.sh 结构
+# Docker 部署引导脚本: 安装 Docker, 创建 compose 配置, 登录 ghcr.io, 配置 nginx, 安装注册 Self-hosted Runner
+# 参考 packages/devops-infrastructure/howleft-website/bootstrap.sh 与 ts-langchain-server/bootstrap.sh 结构
 #
 # 与 ts-langchain-server 的主要差异:
 #   1. docker-compose.yml 仅单个服务(langgraph-aui-app),无 postgres/redis
 #   2. 端口映射 127.0.0.1:3001:3000(Next.js standalone 监听 3000)
-#   3. nginx 监听 8080,proxy_pass 127.0.0.1:3001
-#   4. 不创建 .env(由 CI deploy job 从 GitHub Variables 写入,仅 LANGGRAPH_API_URL 一个非敏感变量)
-#   5. 不执行 docker compose up -d(缺 .env 时容器无法获取 LANGGRAPH_API_URL,首次启动交由 CI)
+#   3. nginx 监听 80(HTTP) + 443(HTTPS,由 certbot 自动签发),proxy_pass 127.0.0.1:3001
+#   4. 通过 Let's Encrypt 为域名 aide.rlagnl.top 签发证书,HTTP 自动跳转 HTTPS
+#   5. 不创建 .env(由 CI deploy job 从 GitHub Variables 写入,仅 LANGGRAPH_API_URL 一个非敏感变量)
+#   6. 不执行 docker compose up -d(缺 .env 时容器无法获取 LANGGRAPH_API_URL,首次启动交由 CI)
 #
 # GITHUB_USER / GITHUB_PAT 支持三种传入方式:
 #   1) 命令行参数: sudo ./bootstrap.sh -u <user> -t <token>
@@ -140,24 +141,29 @@ prompt_password() {
 GITHUB_USER="${GITHUB_USER:-}"
 GITHUB_PAT="${GITHUB_PAT:-}"
 RUNNER_REPO="${RUNNER_REPO:-ai-chat-demo-app}"
+SERVER_NAME="${SERVER_NAME:-aide.rlagnl.top}"            # 对外域名(证书签发对象)
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-250989770@qq.com}"       # Let's Encrypt 通知邮箱(证书过期提醒)
+ENABLE_HTTPS="${ENABLE_HTTPS:-1}"                        # 是否启用 HTTPS(1 启用, 0 跳过)
 
 usage() {
     cat >&2 <<EOF
-用法: sudo $0 [-u GitHub用户名] [-t GitHubToken]
+用法: sudo $0 [-u GitHub用户名] [-t GitHubToken] [-d 域名]
   -u  GitHub 用户名 (也可用环境变量 GITHUB_USER 或交互输入)
   -t  GitHub Personal Access Token (需 repo + write:packages + read:packages 权限)
       repo: 注册 self-hosted runner; write:packages/read:packages: 推拉 ghcr 镜像
   -r  Self-hosted Runner 注册的目标仓库 (默认 ai-chat-demo-app, 也可用环境变量 RUNNER_REPO)
+  -d  HTTPS 域名 (默认 aide.rlagnl.top, 也可用环境变量 SERVER_NAME)
   -h  显示帮助
 EOF
     exit 1
 }
 
-while getopts "u:t:r:h" opt; do
+while getopts "u:t:r:d:h" opt; do
     case "$opt" in
         u) GITHUB_USER="$OPTARG" ;;
         t) GITHUB_PAT="$OPTARG" ;;
         r) RUNNER_REPO="$OPTARG" ;;
+        d) SERVER_NAME="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -324,8 +330,8 @@ NGINX_CONF
     # proxy_read_timeout 86400s: SSE 长连接超时设为 24 小时
     tee /etc/nginx/sites-available/langgraph-aui-app > /dev/null <<'NGINX'
 server {
-    listen 8080;
-    server_name _;
+    listen 80;
+    server_name __DOMAIN__;
 
     # JSON 访问日志(格式定义见 conf.d/langgraph-aui-app-log-format.conf)
     access_log /var/log/nginx/access.log langgraph_aui_app_json;
@@ -359,7 +365,7 @@ server {
     location / {
         proxy_pass http://127.0.0.1:3001;
         proxy_http_version 1.1;
-        # 用 $http_host 保留客户端原始 Host(含端口, 如 8.130.30.183:8080),
+        # 用 $http_host 保留客户端原始 Host(域名访问为 aide.rlagnl.top),
         # 避免 Next.js Server Actions 校验 x-forwarded-host 与 origin 不匹配
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -377,6 +383,9 @@ server {
     }
 }
 NGINX
+    # 将站点配置中的 __DOMAIN__ 占位符替换为实际域名(certbot --nginx 需按 server_name 匹配)
+    sed -i "s/__DOMAIN__/${SERVER_NAME}/g" /etc/nginx/sites-available/langgraph-aui-app
+
     # 移除 nginx 默认站点(遵循工作区规则: 避免 80 端口显示 "Welcome to nginx")
     rm -f /etc/nginx/sites-enabled/default
     ln -sf /etc/nginx/sites-available/langgraph-aui-app /etc/nginx/sites-enabled/langgraph-aui-app
@@ -384,9 +393,41 @@ NGINX
     systemctl reload nginx
 }
 
-# ============ 5. 安装注册 Self-hosted Runner ============
+# ============ 5. 配置 HTTPS (Let's Encrypt) ============
+step_5_setup_https() {
+    # 可通过 ENABLE_HTTPS=0 显式关闭(例如域名尚未解析到本机时)
+    if [[ "${ENABLE_HTTPS:-1}" != "1" ]]; then
+        echo "已设置 ENABLE_HTTPS=0, 跳过 HTTPS 配置"
+        return 0
+    fi
+
+    # 幂等: 证书已签发则跳过, 仅尝试续期
+    if [[ -d "/etc/letsencrypt/live/${SERVER_NAME}" ]]; then
+        echo "证书已存在: /etc/letsencrypt/live/${SERVER_NAME}, 跳过签发"
+        certbot renew --nginx --quiet || true
+        return 0
+    fi
+
+    # 安装 certbot 及其 nginx 插件
+    if ! command -v certbot >/dev/null 2>&1; then
+        apt-get update -qq
+        apt-get install -y -qq certbot python3-certbot-nginx
+    fi
+
+    echo "签发证书并改写 nginx 配置(HTTP 自动跳转 HTTPS)..."
+    # --nginx: 自动定位 server_name 对应的 server 块; --redirect: 追加 80->443 跳转
+    certbot --nginx -d "$SERVER_NAME" \
+        --non-interactive --agree-tos --redirect \
+        -m "$CERTBOT_EMAIL" \
+        --keep-until-expiring
+
+    nginx -t
+    systemctl reload nginx
+}
+
+# ============ 6. 安装注册 Self-hosted Runner ============
 # build 留在 GitHub 托管 runner, 本机 runner 仅执行轻量的 docker compose pull && up -d
-step_5_setup_runner() {
+step_6_setup_runner() {
     echo "确保 jq 已安装(解析 GitHub API 返回的 JSON)..."
     command -v jq >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq jq; }
 
@@ -483,9 +524,9 @@ step_5_setup_runner() {
     ./svc.sh status 2>/dev/null || systemctl status 'actions.runner.*' --no-pager || true
 }
 
-# ============ 6. 验证部署准备 ============
+# ============ 7. 验证部署准备 ============
 # 注意: 服务尚未启动(.env 由 CI 写入), 仅验证基础设施配置
-step_6_verify() {
+step_7_verify() {
     echo "=== 基础设施验证 ==="
 
     # 检查 docker-compose.yml
@@ -515,7 +556,7 @@ step_6_verify() {
     echo "2. 确认仓库 Workflow permissions 设为 Read and write"
     echo "3. 提交代码 push 到 develop 分支触发 CI(或手动 workflow_dispatch)"
     echo "4. CI deploy job 会自动写入 .env 并执行 docker compose up -d"
-    echo "5. 部署完成后访问: http://<服务器IP>:8080"
+    echo "5. 部署完成后访问: https://${SERVER_NAME}"
 }
 
 # ============ 执行所有步骤 ============
@@ -524,15 +565,16 @@ run_step "安装 Docker"               step_1_install_docker
 run_step "创建 compose 配置"         step_2_create_compose
 run_step "登录 ghcr.io"              step_3_login_ghcr
 run_step "配置 nginx 反向代理"        step_4_setup_nginx
-run_step "安装注册 Self-hosted Runner"  step_5_setup_runner
-run_step "验证部署准备"              step_6_verify
+run_step "配置 HTTPS 证书"            step_5_setup_https
+run_step "安装注册 Self-hosted Runner"  step_6_setup_runner
+run_step "验证部署准备"              step_7_verify
 
-SERVER_IP="$(curl -s ifconfig.me 2>/dev/null || echo "<服务器IP>")"
 printf '\n%s========================================%s\n' "$GREEN" "$NC"
 printf '%s基础设施初始化完成!%s\n' "$GREEN" "$NC"
 printf '项目目录: /opt/langgraph-aui-app\n'
-printf 'nginx 端口: 8080 (对外)\n'
+printf 'nginx 端口: 80/443 (HTTP/HTTPS)\n'
 printf '内部端口: 127.0.0.1:3001 (容器内 3000)\n'
+printf '访问域名: %s\n' "$SERVER_NAME"
 printf '\n下一步: 在 GitHub 配置 2 个 Variables 并 push 到 develop 触发 CI\n'
-printf '部署完成后访问: http://%s:8080\n' "$SERVER_IP"
+printf '部署完成后访问: https://%s\n' "$SERVER_NAME"
 printf '%s========================================%s\n' "$GREEN" "$NC"
