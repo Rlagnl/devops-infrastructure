@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Docker 部署引导脚本: 安装 Docker, 创建 compose 配置, 拉取启动服务, 配置 nginx, 安装注册 Self-hosted Runner
-# 参考 bootstrap.sh 的分步骤执行 + 错误处理 + gum 交互模式
+# Docker 部署引导脚本: 安装 Docker, 创建 compose 配置, 拉取启动服务, 配置 nginx, 配置 HTTPS, 安装注册 Self-hosted Runner
+# 参考 langgraph-aui-app/bootstrap.sh 的分步骤执行 + 错误处理 + gum 交互模式
 # GITHUB_USER / GITHUB_PAT 支持三种传入方式:
 #   1) 命令行参数: sudo ./docker_bootstrap.sh -u <user> -t <token>
 #   2) 环境变量:   sudo GITHUB_USER=... GITHUB_PAT=... ./docker_bootstrap.sh
 #   3) 交互式输入: 不传任何参数, 脚本运行后用 gum/read 提示输入
 #
+# ALIYUN_ACCESS_KEY_ID / ALIYUN_ACCESS_KEY_SECRET 同样支持三种传入方式(DNS-01 签发证书):
+#   1) 命令行参数: sudo ./docker_bootstrap.sh -k <AccessKeyID> -s <AccessKeySecret>
+#   2) 环境变量:   sudo ALIYUN_ACCESS_KEY_ID=... ALIYUN_ACCESS_KEY_SECRET=... ./docker_bootstrap.sh
+#   3) 交互式输入: 不传时脚本运行后提示输入
+#
+# HTTPS 通过 Let's Encrypt DNS-01(阿里云 DNS)签发证书, 域名默认 doc.aui.rlagnl.top
 # 镜像拉取自 ghcr.io, 使用 GITHUB_PAT 认证
 
 set -euo pipefail  # 未定义变量报错, 管道失败传递, 命令失败由 ERR trap 统一处理并退出
@@ -150,24 +156,35 @@ GITHUB_USER="${GITHUB_USER:-}"
 GITHUB_PAT="${GITHUB_PAT:-}"
 # runner 注册的目标仓库(应用仓库), 可用环境变量 RUNNER_REPO 或 -r 参数覆盖
 RUNNER_REPO="${RUNNER_REPO:-ai-chat-demo-app}"
+SERVER_NAME="${SERVER_NAME:-doc.aui.rlagnl.top}"          # 对外域名(证书签发对象)
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-250989770@qq.com}"        # Let's Encrypt 通知邮箱(证书过期提醒)
+ENABLE_HTTPS="${ENABLE_HTTPS:-1}"                         # 是否启用 HTTPS(1 启用, 0 跳过)
+ALIYUN_ACCESS_KEY_ID="${ALIYUN_ACCESS_KEY_ID:-}"          # 阿里云 RAM AccessKey ID(DNS-01 签发证书)
+ALIYUN_ACCESS_KEY_SECRET="${ALIYUN_ACCESS_KEY_SECRET:-}"  # 阿里云 RAM AccessKey Secret(DNS-01 签发证书)
 
 usage() {
     cat >&2 <<EOF
-用法: sudo $0 [-u GitHub用户名] [-t GitHubToken]
+用法: sudo $0 [-u GitHub用户名] [-t GitHubToken] [-d 域名] [-k AccessKeyID] [-s AccessKeySecret]
   -u  GitHub 用户名 (也可用环境变量 GITHUB_USER 或交互输入)
   -t  GitHub Personal Access Token (需 repo + write:packages + read:packages 权限)
       repo: 注册 self-hosted runner; write:packages/read:packages: 推拉 ghcr 镜像
   -r  Self-hosted Runner 注册的目标仓库 (默认 ai-chat-demo-app, 也可用环境变量 RUNNER_REPO)
+  -d  HTTPS 域名 (默认 doc.aui.rlagnl.top, 也可用环境变量 SERVER_NAME)
+  -k  阿里云 AccessKey ID (DNS-01 签发证书, 需 AliyunDNSFullAccess 权限, 也可用环境变量 ALIYUN_ACCESS_KEY_ID)
+  -s  阿里云 AccessKey Secret (也可用环境变量 ALIYUN_ACCESS_KEY_SECRET)
   -h  显示帮助
 EOF
     exit 1
 }
 
-while getopts "u:t:r:h" opt; do
+while getopts "u:t:r:d:k:s:h" opt; do
     case "$opt" in
         u) GITHUB_USER="$OPTARG" ;;
         t) GITHUB_PAT="$OPTARG" ;;
         r) RUNNER_REPO="$OPTARG" ;;
+        d) SERVER_NAME="$OPTARG" ;;
+        k) ALIYUN_ACCESS_KEY_ID="$OPTARG" ;;
+        s) ALIYUN_ACCESS_KEY_SECRET="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -232,6 +249,29 @@ step_0_collect_credentials() {
         echo "已通过参数/环境变量获取 GitHub Token (隐藏显示)"
     fi
     echo "Self-hosted Runner 将注册到: ${GITHUB_USER}/${RUNNER_REPO}"
+
+    # 收集阿里云 RAM AccessKey(DNS-01 签发证书需要, 仅当启用 HTTPS 时)
+    if [[ "${ENABLE_HTTPS:-1}" == "1" ]]; then
+        if [[ -z "$ALIYUN_ACCESS_KEY_ID" ]]; then
+            while true; do
+                ALIYUN_ACCESS_KEY_ID="$(prompt_input "请输入阿里云 AccessKey ID (需 AliyunDNSFullAccess 权限):")"
+                [[ -n "$ALIYUN_ACCESS_KEY_ID" ]] && break
+                echo "AccessKey ID 不能为空, 请重新输入"
+            done
+        else
+            echo "已通过参数/环境变量获取阿里云 AccessKey ID: $ALIYUN_ACCESS_KEY_ID"
+        fi
+
+        if [[ -z "$ALIYUN_ACCESS_KEY_SECRET" ]]; then
+            while true; do
+                ALIYUN_ACCESS_KEY_SECRET="$(prompt_password "请输入阿里云 AccessKey Secret:")"
+                [[ -n "$ALIYUN_ACCESS_KEY_SECRET" ]] && break
+                echo "AccessKey Secret 不能为空, 请重新输入"
+            done
+        else
+            echo "已通过参数/环境变量获取阿里云 AccessKey Secret (隐藏显示)"
+        fi
+    fi
 }
 
 # ============ 1. 安装 Docker ============
@@ -338,11 +378,11 @@ map $status $aui_components_doc_log_level {
 log_format aui_components_doc_json escape=json '{"timestamp":"$time_iso8601","level":"$aui_components_doc_log_level","service":"aui-components-doc","message":"$request_method $uri $status","event":"http_request","trace_id":"$request_id","http":{"method":"$request_method","uri":"$uri","status":$status},"duration_ms":$request_time,"user_agent":"$http_user_agent"}';
 NGINX_CONF
 
-    # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开
+    # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开; __DOMAIN__ 由后续 sed 替换
     tee /etc/nginx/sites-available/aui-components-doc > /dev/null <<'NGINX'
 server {
-    listen 8082;
-    server_name _;
+    listen 80;
+    server_name __DOMAIN__;
 
     # JSON 访问日志(格式定义见 conf.d/aui-components-doc-log-format.conf)
     access_log /var/log/nginx/access.log aui_components_doc_json;
@@ -382,6 +422,9 @@ server {
     }
 }
 NGINX
+    # 将站点配置中的 __DOMAIN__ 占位符替换为实际域名(certbot 按 server_name 匹配签发对象)
+    sed -i "s/__DOMAIN__/${SERVER_NAME}/g" /etc/nginx/sites-available/aui-components-doc
+
     # 移除 nginx 默认站点(遵循工作区规则: 避免 80 端口显示 "Welcome to nginx")
     rm -f /etc/nginx/sites-enabled/default
     ln -sf /etc/nginx/sites-available/aui-components-doc /etc/nginx/sites-enabled/aui-components-doc
@@ -390,10 +433,126 @@ NGINX
     systemctl reload nginx
 }
 
-# ============ 5. 安装注册 Self-hosted Runner ============
+# ============ 5. 配置 HTTPS (Let's Encrypt DNS-01) ============
+# 使用 DNS-01 验证(阿里云 DNS), 绕开 80 端口的 HTTP-01 验证
+# 原因: 阿里云大陆 ECS 对 80 端口「境外访问未备案域名」的明文 HTTP 拦截(返回 403),
+#       Let's Encrypt HTTP-01 验证走 80 端口, 会被拦截导致证书签发失败
+#       DNS-01 通过 DNS TXT 记录验证, 不依赖 80 端口, 证书照常签发
+step_5_setup_https() {
+    # 可通过 ENABLE_HTTPS=0 显式关闭(例如域名尚未解析到本机时)
+    if [[ "${ENABLE_HTTPS:-1}" != "1" ]]; then
+        echo "已设置 ENABLE_HTTPS=0, 跳过 HTTPS 配置"
+        return 0
+    fi
+
+    # 幂等: 证书已签发则跳过, 仅尝试续期
+    if [[ -d "/etc/letsencrypt/live/${SERVER_NAME}" ]]; then
+        echo "证书已存在: /etc/letsencrypt/live/${SERVER_NAME}, 跳过签发"
+        certbot renew --quiet || true
+        systemctl reload nginx || true
+        return 0
+    fi
+
+    # 安装 certbot 本体(apt 源)
+    if ! command -v certbot >/dev/null 2>&1; then
+        apt-get update -qq
+        apt-get install -y -qq certbot
+    fi
+
+    # 安装 certbot-dns-aliyun 第三方插件(阿里云 DNS 验证, 官方未内置)
+    # 先确保 pip3 存在; 插件通过 pip 安装, 用阿里云 PyPI 镜像加速
+    if ! python3 -c "import certbot_dns_aliyun" >/dev/null 2>&1; then
+        command -v pip3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3-pip; }
+        # Ubuntu 24.04(PEP 668)禁止 pip 装到系统环境, 需 --break-system-packages; 旧版无此参数则走普通安装
+        pip3 install -i https://mirrors.aliyun.com/pypi/simple/ certbot-dns-aliyun \
+            || pip3 install --break-system-packages -i https://mirrors.aliyun.com/pypi/simple/ certbot-dns-aliyun
+    fi
+
+    # 写阿里云 RAM 凭证文件(供 dns-aliyun 插件调用 API 添加 TXT 记录)
+    mkdir -p /etc/letsencrypt
+    cat > /etc/letsencrypt/aliyun-credentials.ini <<EOF
+dns_aliyun_access_key = ${ALIYUN_ACCESS_KEY_ID}
+dns_aliyun_access_key_secret = ${ALIYUN_ACCESS_KEY_SECRET}
+EOF
+    chmod 600 /etc/letsencrypt/aliyun-credentials.ini
+
+    echo "通过 DNS-01 验证签发证书(阿里云 DNS, 不依赖 80 端口)..."
+    # --deploy-hook: 签发/续期成功后自动 reload nginx, 后续自动续期无需手动干预
+    certbot certonly \
+        --authenticator dns-aliyun \
+        --dns-aliyun-credentials /etc/letsencrypt/aliyun-credentials.ini \
+        -d "$SERVER_NAME" \
+        --non-interactive --agree-tos \
+        -m "$CERTBOT_EMAIL" \
+        --keep-until-expiring \
+        --deploy-hook "systemctl reload nginx"
+
+    # 证书签出后重新生成站点配置: 80 端口 301 跳转 HTTPS, 443 端口 SSL 终结 + 完整反向代理
+    # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开; __DOMAIN__ 由 sed 替换
+    tee /etc/nginx/sites-available/aui-components-doc > /dev/null <<'NGINX'
+# HTTP → HTTPS 跳转
+server {
+    listen 80;
+    server_name __DOMAIN__;
+    return 301 https://$host$request_uri;
+}
+
+# HTTPS 服务
+server {
+    listen 443 ssl;
+    server_name __DOMAIN__;
+
+    ssl_certificate /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
+
+    # JSON 访问日志(格式定义见 conf.d/aui-components-doc-log-format.conf)
+    access_log /var/log/nginx/access.log aui_components_doc_json;
+
+    # Next.js 静态导出资源不记访问日志, 排除噪音
+    location /_next/static/ {
+        access_log off;
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 图片/字体等静态资源不记访问日志
+    location ~* \.(png|jpg|jpeg|gif|ico|svg|webp|woff2?|ttf|eot)$ {
+        access_log off;
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # WebSocket 支持
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+NGINX
+    sed -i "s/__DOMAIN__/${SERVER_NAME}/g" /etc/nginx/sites-available/aui-components-doc
+
+    nginx -t
+    systemctl reload nginx
+}
+
+# ============ 6. 安装注册 Self-hosted Runner ============
 # 替代 Watchtower: build 留在 GitHub 托管 runner(VPS 仅 1GB 内存无法 build),
 # 本机 runner 仅执行轻量的 docker compose pull && up -d, 由 push 触发, 无需 SSH/docker.io
-step_5_setup_runner() {
+step_6_setup_runner() {
     echo "确保 jq 已安装(解析 GitHub API 返回的 JSON)..."
     command -v jq >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq jq; }
 
@@ -498,17 +657,24 @@ step_5_setup_runner() {
     ./svc.sh status 2>/dev/null || systemctl status 'actions.runner.*' --no-pager || true
 }
 
-# ============ 6. 验证部署 ============
-step_6_verify() {
+# ============ 7. 验证部署 ============
+step_7_verify() {
     # 容器刚启动需要短暂时间进入 ready 状态
     sleep 2
-    local internal_code ext_code
+    local internal_code https_code
     # || echo "000" 兜底: 连接失败时 curl 返回非 0, 用 000 表示不可达, 不触发 set -e
     internal_code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000 || echo "000")"
-    ext_code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8082 || echo "000")"
     echo "容器内部响应(127.0.0.1:3000): $internal_code"
-    echo "nginx 转发响应(127.0.0.1:8082): $ext_code"
-    if [[ "$internal_code" != "200" && "$ext_code" != "200" ]]; then
+    if [[ "${ENABLE_HTTPS:-1}" == "1" ]]; then
+        # --resolve 强制域名解析到 127.0.0.1 并携带 SNI, 正确命中 HTTPS server 块,
+        # 同时绕开公网 IP 回环(hairpin NAT)可能不通的问题
+        https_code="$(curl -sk --resolve "${SERVER_NAME}:443:127.0.0.1" \
+            -o /dev/null -w "%{http_code}" "https://${SERVER_NAME}/" || echo "000")"
+        echo "HTTPS 转发响应(https://${SERVER_NAME}): $https_code"
+    else
+        https_code="000"
+    fi
+    if [[ "$internal_code" != "200" && "$https_code" != "200" ]]; then
         echo "警告: 服务未正常响应, 请检查容器日志: docker logs aui-components-doc"
     fi
     echo "Self-hosted Runner 服务: $(systemctl is-active 'actions.runner.*' 2>/dev/null || echo unknown)"
@@ -520,13 +686,13 @@ run_step "安装 Docker"               step_1_install_docker
 run_step "创建 compose 配置"         step_2_create_compose
 run_step "登录 ghcr.io 并启动服务"   step_3_login_and_start
 run_step "配置 nginx 反向代理"        step_4_setup_nginx
-run_step "安装注册 Self-hosted Runner"  step_5_setup_runner
-run_step "验证部署"                  step_6_verify
+run_step "配置 HTTPS 证书"            step_5_setup_https
+run_step "安装注册 Self-hosted Runner"  step_6_setup_runner
+run_step "验证部署"                  step_7_verify
 
-SERVER_IP="$(curl -s ifconfig.me 2>/dev/null || echo "<服务器IP>")"
 printf '\n%s========================================%s\n' "$GREEN" "$NC"
 printf '%s所有步骤执行完成! 服务已部署成功。%s\n' "$GREEN" "$NC"
-printf '访问地址: http://%s:8082\n' "$SERVER_IP"
+printf '访问地址: https://%s\n' "$SERVER_NAME"
 printf '项目目录: /opt/aui-components-doc\n'
 printf 'git push 即自动部署 (Self-hosted Runner 拉取 ghcr 镜像并重启)\n'
 printf '%s========================================%s\n' "$GREEN" "$NC"
