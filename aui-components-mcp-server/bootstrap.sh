@@ -364,28 +364,27 @@ step_5_setup_https() {
         return 0
     fi
 
-    # 幂等: 证书已签发则跳过, 仅尝试续期
-    if [[ -d "/etc/letsencrypt/live/${SERVER_NAME}" ]]; then
-        echo "证书已存在: /etc/letsencrypt/live/${SERVER_NAME}, 跳过签发"
-        certbot renew --quiet || true
-        systemctl reload nginx || true
-        return 0
-    fi
-
     # 安装 certbot 及其 nginx 插件(certonly --nginx 需要 nginx 插件)
     if ! command -v certbot >/dev/null 2>&1; then
         apt-get update -qq
         apt-get install -y -qq certbot python3-certbot-nginx
     fi
 
-    echo "通过 HTTP-01 验证签发证书(仅签发, 不自动改写 nginx)..."
-    # certonly --nginx: HTTP-01 验证, 只签发证书, 不改写 nginx 配置
-    certbot certonly --nginx -d "$SERVER_NAME" \
-        --non-interactive --agree-tos \
-        -m "$CERTBOT_EMAIL" \
-        --keep-until-expiring
+    # 签发证书(幂等): 已存在则只续期, 不重复签发
+    if [[ -d "/etc/letsencrypt/live/${SERVER_NAME}" ]]; then
+        echo "证书已存在: /etc/letsencrypt/live/${SERVER_NAME}, 跳过签发, 仅续期"
+        certbot renew --quiet || true
+    else
+        echo "通过 HTTP-01 验证签发证书(仅签发, 不自动改写 nginx)..."
+        # certonly --nginx: HTTP-01 验证, 只签发证书, 不改写 nginx 配置
+        certbot certonly --nginx -d "$SERVER_NAME" \
+            --non-interactive --agree-tos \
+            -m "$CERTBOT_EMAIL" \
+            --keep-until-expiring
+    fi
 
-    # 证书签出后手动生成 80(301 跳转) + 443(SSL 终结) 站点配置
+    # 无论证书是否已存在, 都重写 nginx 配置(幂等): 保证 443 server 块始终正确
+    # 证书已存在但 nginx 配置被改乱时(如之前 certbot --nginx 残留), 重跑也能修复
     # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开; __DOMAIN__ 由 sed 替换
     tee /etc/nginx/sites-available/aui-components-mcp-server > /dev/null <<'NGINX'
 # HTTP → HTTPS 跳转
