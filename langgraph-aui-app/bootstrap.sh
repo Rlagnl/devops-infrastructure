@@ -5,8 +5,8 @@
 # 与 ts-langchain-server 的主要差异:
 #   1. docker-compose.yml 仅单个服务(langgraph-aui-app),无 postgres/redis
 #   2. 端口映射 127.0.0.1:3001:3000(Next.js standalone 监听 3000)
-#   3. nginx 监听 80(HTTP) + 443(HTTPS,由 certbot 自动签发),proxy_pass 127.0.0.1:3001
-#   4. 通过 Let's Encrypt 为域名 aide.rlagnl.top 签发证书,HTTP 自动跳转 HTTPS
+#   3. nginx 监听 80(HTTP, 301 跳转) + 443(HTTPS),proxy_pass 127.0.0.1:3001
+#   4. 通过 Let's Encrypt DNS-01(阿里云 DNS)为 aide.rlagnl.top 签发证书, 绕开 80 端口备案拦截
 #   5. 不创建 .env(由 CI deploy job 从 GitHub Variables 写入,仅 LANGGRAPH_API_URL 一个非敏感变量)
 #   6. 不执行 docker compose up -d(缺 .env 时容器无法获取 LANGGRAPH_API_URL,首次启动交由 CI)
 #
@@ -14,6 +14,11 @@
 #   1) 命令行参数: sudo ./bootstrap.sh -u <user> -t <token>
 #   2) 环境变量:   sudo GITHUB_USER=... GITHUB_PAT=... ./bootstrap.sh
 #   3) 交互式输入: 不传任何参数, 脚本运行后用 gum/read 提示输入
+#
+# ALIYUN_ACCESS_KEY_ID / ALIYUN_ACCESS_KEY_SECRET 同样支持三种传入方式(DNS-01 签发证书):
+#   1) 命令行参数: sudo ./bootstrap.sh -k <AccessKeyID> -s <AccessKeySecret>
+#   2) 环境变量:   sudo ALIYUN_ACCESS_KEY_ID=... ALIYUN_ACCESS_KEY_SECRET=... ./bootstrap.sh
+#   3) 交互式输入: 不传时脚本运行后提示输入
 #
 # 镜像拉取自 ghcr.io, 使用 GITHUB_PAT 认证
 
@@ -144,26 +149,32 @@ RUNNER_REPO="${RUNNER_REPO:-ai-chat-demo-app}"
 SERVER_NAME="${SERVER_NAME:-aide.rlagnl.top}"            # 对外域名(证书签发对象)
 CERTBOT_EMAIL="${CERTBOT_EMAIL:-250989770@qq.com}"       # Let's Encrypt 通知邮箱(证书过期提醒)
 ENABLE_HTTPS="${ENABLE_HTTPS:-1}"                        # 是否启用 HTTPS(1 启用, 0 跳过)
+ALIYUN_ACCESS_KEY_ID="${ALIYUN_ACCESS_KEY_ID:-}"         # 阿里云 RAM AccessKey ID(DNS-01 签发证书)
+ALIYUN_ACCESS_KEY_SECRET="${ALIYUN_ACCESS_KEY_SECRET:-}" # 阿里云 RAM AccessKey Secret(DNS-01 签发证书)
 
 usage() {
     cat >&2 <<EOF
-用法: sudo $0 [-u GitHub用户名] [-t GitHubToken] [-d 域名]
+用法: sudo $0 [-u GitHub用户名] [-t GitHubToken] [-d 域名] [-k AccessKeyID] [-s AccessKeySecret]
   -u  GitHub 用户名 (也可用环境变量 GITHUB_USER 或交互输入)
   -t  GitHub Personal Access Token (需 repo + write:packages + read:packages 权限)
       repo: 注册 self-hosted runner; write:packages/read:packages: 推拉 ghcr 镜像
   -r  Self-hosted Runner 注册的目标仓库 (默认 ai-chat-demo-app, 也可用环境变量 RUNNER_REPO)
   -d  HTTPS 域名 (默认 aide.rlagnl.top, 也可用环境变量 SERVER_NAME)
+  -k  阿里云 AccessKey ID (DNS-01 签发证书, 需 AliyunDNSFullAccess 权限, 也可用环境变量 ALIYUN_ACCESS_KEY_ID)
+  -s  阿里云 AccessKey Secret (也可用环境变量 ALIYUN_ACCESS_KEY_SECRET)
   -h  显示帮助
 EOF
     exit 1
 }
 
-while getopts "u:t:r:d:h" opt; do
+while getopts "u:t:r:d:k:s:h" opt; do
     case "$opt" in
         u) GITHUB_USER="$OPTARG" ;;
         t) GITHUB_PAT="$OPTARG" ;;
         r) RUNNER_REPO="$OPTARG" ;;
         d) SERVER_NAME="$OPTARG" ;;
+        k) ALIYUN_ACCESS_KEY_ID="$OPTARG" ;;
+        s) ALIYUN_ACCESS_KEY_SECRET="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -219,6 +230,29 @@ step_0_collect_credentials() {
         echo "已通过参数/环境变量获取 GitHub Token (隐藏显示)"
     fi
     echo "Self-hosted Runner 将注册到: ${GITHUB_USER}/${RUNNER_REPO}"
+
+    # 收集阿里云 RAM AccessKey(DNS-01 签发证书需要, 仅当启用 HTTPS 时)
+    if [[ "${ENABLE_HTTPS:-1}" == "1" ]]; then
+        if [[ -z "$ALIYUN_ACCESS_KEY_ID" ]]; then
+            while true; do
+                ALIYUN_ACCESS_KEY_ID="$(prompt_input "请输入阿里云 AccessKey ID (需 AliyunDNSFullAccess 权限):")"
+                [[ -n "$ALIYUN_ACCESS_KEY_ID" ]] && break
+                echo "AccessKey ID 不能为空, 请重新输入"
+            done
+        else
+            echo "已通过参数/环境变量获取阿里云 AccessKey ID: $ALIYUN_ACCESS_KEY_ID"
+        fi
+
+        if [[ -z "$ALIYUN_ACCESS_KEY_SECRET" ]]; then
+            while true; do
+                ALIYUN_ACCESS_KEY_SECRET="$(prompt_password "请输入阿里云 AccessKey Secret:")"
+                [[ -n "$ALIYUN_ACCESS_KEY_SECRET" ]] && break
+                echo "AccessKey Secret 不能为空, 请重新输入"
+            done
+        else
+            echo "已通过参数/环境变量获取阿里云 AccessKey Secret (隐藏显示)"
+        fi
+    fi
 }
 
 # ============ 1. 安装 Docker ============
@@ -393,7 +427,11 @@ NGINX
     systemctl reload nginx
 }
 
-# ============ 5. 配置 HTTPS (Let's Encrypt) ============
+# ============ 5. 配置 HTTPS (Let's Encrypt DNS-01) ============
+# 使用 DNS-01 验证(阿里云 DNS), 绕开 80 端口的 HTTP-01 验证
+# 原因: 阿里云大陆 ECS 对 80 端口「境外访问未备案域名」的明文 HTTP 拦截(返回 403),
+#       Let's Encrypt HTTP-01 验证走 80 端口, 会被拦截导致证书签发失败
+#       DNS-01 通过 DNS TXT 记录验证, 不依赖 80 端口, 证书照常签发
 step_5_setup_https() {
     # 可通过 ENABLE_HTTPS=0 显式关闭(例如域名尚未解析到本机时)
     if [[ "${ENABLE_HTTPS:-1}" != "1" ]]; then
@@ -404,22 +442,113 @@ step_5_setup_https() {
     # 幂等: 证书已签发则跳过, 仅尝试续期
     if [[ -d "/etc/letsencrypt/live/${SERVER_NAME}" ]]; then
         echo "证书已存在: /etc/letsencrypt/live/${SERVER_NAME}, 跳过签发"
-        certbot renew --nginx --quiet || true
+        certbot renew --quiet || true
+        systemctl reload nginx || true
         return 0
     fi
 
-    # 安装 certbot 及其 nginx 插件
+    # 安装 certbot 本体(apt 源)
     if ! command -v certbot >/dev/null 2>&1; then
         apt-get update -qq
-        apt-get install -y -qq certbot python3-certbot-nginx
+        apt-get install -y -qq certbot
     fi
 
-    echo "签发证书并改写 nginx 配置(HTTP 自动跳转 HTTPS)..."
-    # --nginx: 自动定位 server_name 对应的 server 块; --redirect: 追加 80->443 跳转
-    certbot --nginx -d "$SERVER_NAME" \
-        --non-interactive --agree-tos --redirect \
+    # 安装 certbot-dns-aliyun 第三方插件(阿里云 DNS 验证, 官方未内置)
+    # 先确保 pip3 存在; 插件通过 pip 安装, 用阿里云 PyPI 镜像加速
+    if ! python3 -c "import certbot_dns_aliyun" >/dev/null 2>&1; then
+        command -v pip3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3-pip; }
+        # Ubuntu 24.04(PEP 668)禁止 pip 装到系统环境, 需 --break-system-packages; 旧版无此参数则走普通安装
+        pip3 install -i https://mirrors.aliyun.com/pypi/simple/ certbot-dns-aliyun \
+            || pip3 install --break-system-packages -i https://mirrors.aliyun.com/pypi/simple/ certbot-dns-aliyun
+    fi
+
+    # 写阿里云 RAM 凭证文件(供 dns-aliyun 插件调用 API 添加 TXT 记录)
+    mkdir -p /etc/letsencrypt
+    cat > /etc/letsencrypt/aliyun-credentials.ini <<EOF
+dns_aliyun_access_key = ${ALIYUN_ACCESS_KEY_ID}
+dns_aliyun_access_key_secret = ${ALIYUN_ACCESS_KEY_SECRET}
+EOF
+    chmod 600 /etc/letsencrypt/aliyun-credentials.ini
+
+    echo "通过 DNS-01 验证签发证书(阿里云 DNS, 不依赖 80 端口)..."
+    # --deploy-hook: 签发/续期成功后自动 reload nginx, 后续自动续期无需手动干预
+    certbot certonly \
+        --authenticator dns-aliyun \
+        --dns-aliyun-credentials /etc/letsencrypt/aliyun-credentials.ini \
+        -d "$SERVER_NAME" \
+        --non-interactive --agree-tos \
         -m "$CERTBOT_EMAIL" \
-        --keep-until-expiring
+        --keep-until-expiring \
+        --deploy-hook "systemctl reload nginx"
+
+    # 证书签出后重新生成站点配置: 80 端口 301 跳转 HTTPS, 443 端口 SSL 终结 + 完整反向代理
+    # 'NGINX' 加引号: $host/$http_host 等 nginx 变量不被 shell 展开; __DOMAIN__ 由 sed 替换
+    tee /etc/nginx/sites-available/langgraph-aui-app > /dev/null <<'NGINX'
+# HTTP → HTTPS 跳转
+server {
+    listen 80;
+    server_name __DOMAIN__;
+    return 301 https://$host$request_uri;
+}
+
+# HTTPS 服务
+server {
+    listen 443 ssl;
+    server_name __DOMAIN__;
+
+    ssl_certificate /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;
+
+    # JSON 访问日志(格式定义见 conf.d/langgraph-aui-app-log-format.conf)
+    access_log /var/log/nginx/access.log langgraph_aui_app_json;
+
+    # 关闭缓冲, 支持 SSE 流式响应
+    proxy_buffering off;
+    proxy_cache off;
+
+    # Next.js 框架静态资源不记访问日志, 排除噪音
+    location /_next/static/ {
+        access_log off;
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 图片/字体等静态资源不记访问日志
+    location ~* \.(png|jpg|jpeg|gif|ico|svg|webp|woff2?|ttf|eot)$ {
+        access_log off;
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        # 用 $http_host 保留客户端原始 Host, 避免 Next.js Server Actions 校验 x-forwarded-host 与 origin 不匹配
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 透传 request_id 给应用, 应用侧 createHttpLogger 取同源 trace_id
+        proxy_set_header X-Request-Id $request_id;
+
+        # SSE 长连接支持
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+}
+NGINX
+    sed -i "s/__DOMAIN__/${SERVER_NAME}/g" /etc/nginx/sites-available/langgraph-aui-app
 
     nginx -t
     systemctl reload nginx
