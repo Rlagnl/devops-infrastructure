@@ -6,7 +6,7 @@
 #   1. docker-compose.yml 仅单个服务(langgraph-aui-app),无 postgres/redis
 #   2. 端口映射 127.0.0.1:3001:3000(Next.js standalone 监听 3000)
 #   3. nginx 监听 80(HTTP, 301 跳转) + 443(HTTPS),proxy_pass 127.0.0.1:3001
-#   4. 通过 Let's Encrypt DNS-01(阿里云 DNS)为 aide.rlagnl.top 签发证书, 绕开 80 端口备案拦截
+#   4. 通过 Let's Encrypt DNS-01(阿里云 DNS)为 aide.rlagnl.top 签发证书(server 块复杂, HTTP-01 不可靠)
 #   5. 不创建 .env(由 CI deploy job 从 GitHub Variables 写入,仅 LANGGRAPH_API_URL 一个非敏感变量)
 #   6. 不执行 docker compose up -d(缺 .env 时容器无法获取 LANGGRAPH_API_URL,首次启动交由 CI)
 #
@@ -429,9 +429,9 @@ NGINX
 
 # ============ 5. 配置 HTTPS (Let's Encrypt DNS-01) ============
 # 使用 DNS-01 验证(阿里云 DNS), 绕开 80 端口的 HTTP-01 验证
-# 原因: 阿里云大陆 ECS 对 80 端口「境外访问未备案域名」的明文 HTTP 拦截(返回 403),
-#       Let's Encrypt HTTP-01 验证走 80 端口, 会被拦截导致证书签发失败
-#       DNS-01 通过 DNS TXT 记录验证, 不依赖 80 端口, 证书照常签发
+# 原因: 本项目 server 块含正则 location + 多个 location, certbot --nginx 无法正确注入
+#       .well-known/acme-challenge 校验 location, 导致 HTTP-01 校验失败
+#       DNS-01 通过 DNS TXT 记录验证, 不依赖 nginx 配置, 证书照常签发
 step_5_setup_https() {
     # 可通过 ENABLE_HTTPS=0 显式关闭(例如域名尚未解析到本机时)
     if [[ "${ENABLE_HTTPS:-1}" != "1" ]]; then

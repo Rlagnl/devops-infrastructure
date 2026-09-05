@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Docker 部署引导脚本: 安装 Docker, 创建 compose 配置(三服务), 配置 nginx + HTTPS, 安装注册 Self-hosted Runner
-# HTTPS 方式参考 packages/devops-infrastructure/aui-components-mcp-server/bootstrap.sh(certbot --nginx)
+# HTTPS 方式参考 packages/devops-infrastructure/langgraph-aui-app/bootstrap.sh(Let's Encrypt DNS-01 阿里云 DNS)
 #
 # 与 ts-langchain-server 的主要差异:
 #   1. Python 版用 langgraph build 构建镜像(非 langgraphjs build)
@@ -8,7 +8,7 @@
 #   3. 不创建 .env(由 CI deploy job 从 GitHub Variables/Secrets 写入,避免明文凭证残留服务器)
 #   4. 不执行 docker compose up -d(缺少 .env 时 Postgres 启动失败,首次启动交由 CI 完成)
 #   5. nginx 监听 80(HTTP 301 跳转) + 443(HTTPS),proxy_pass 127.0.0.1:2025,支持 SSE 长连接
-#   6. HTTPS 用 certbot --nginx(HTTP-01)自动签发 + 改写 nginx
+#   6. 通过 Let's Encrypt DNS-01(阿里云 DNS)为 api.aide.rlagnl.top 签发证书
 #   7. 数据目录 /opt/langgraph-server/
 #   8. 比 TS 版多 Supabase / DashScope / Cohere 相关 RAG 变量
 #
@@ -16,6 +16,11 @@
 #   1) 命令行参数: sudo ./bootstrap.sh -u <user> -t <token>
 #   2) 环境变量:   sudo GITHUB_USER=... GITHUB_PAT=... ./bootstrap.sh
 #   3) 交互式输入: 不传任何参数, 脚本运行后用 gum/read 提示输入
+#
+# ALIYUN_ACCESS_KEY_ID / ALIYUN_ACCESS_KEY_SECRET 同样支持三种传入方式(DNS-01 签发证书):
+#   1) 命令行参数: sudo ./bootstrap.sh -k <AccessKeyID> -s <AccessKeySecret>
+#   2) 环境变量:   sudo ALIYUN_ACCESS_KEY_ID=... ALIYUN_ACCESS_KEY_SECRET=... ./bootstrap.sh
+#   3) 交互式输入: 不传时脚本运行后提示输入
 #
 # 镜像拉取自 ghcr.io, 使用 GITHUB_PAT 认证
 
@@ -143,29 +148,35 @@ prompt_password() {
 GITHUB_USER="${GITHUB_USER:-}"
 GITHUB_PAT="${GITHUB_PAT:-}"
 RUNNER_REPO="${RUNNER_REPO:-ai-chat-demo-app}"
-SERVER_NAME="${SERVER_NAME:-api.aide.rlagnl.top}"      # 对外域名(证书签发对象)
-CERTBOT_EMAIL="${CERTBOT_EMAIL:-250989770@qq.com}"    # Let's Encrypt 通知邮箱(证书过期提醒)
-ENABLE_HTTPS="${ENABLE_HTTPS:-1}"                     # 是否启用 HTTPS(1 启用, 0 跳过)
+SERVER_NAME="${SERVER_NAME:-api.aide.rlagnl.top}"            # 对外域名(证书签发对象)
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-250989770@qq.com}"       # Let's Encrypt 通知邮箱(证书过期提醒)
+ENABLE_HTTPS="${ENABLE_HTTPS:-1}"                        # 是否启用 HTTPS(1 启用, 0 跳过)
+ALIYUN_ACCESS_KEY_ID="${ALIYUN_ACCESS_KEY_ID:-}"         # 阿里云 RAM AccessKey ID(DNS-01 签发证书)
+ALIYUN_ACCESS_KEY_SECRET="${ALIYUN_ACCESS_KEY_SECRET:-}" # 阿里云 RAM AccessKey Secret(DNS-01 签发证书)
 
 usage() {
     cat >&2 <<EOF
-用法: sudo $0 [-u GitHub用户名] [-t GitHubToken] [-d 域名]
+用法: sudo $0 [-u GitHub用户名] [-t GitHubToken] [-d 域名] [-k AccessKeyID] [-s AccessKeySecret]
   -u  GitHub 用户名 (也可用环境变量 GITHUB_USER 或交互输入)
   -t  GitHub Personal Access Token (需 repo + write:packages + read:packages 权限)
       repo: 注册 self-hosted runner; write:packages/read:packages: 推拉 ghcr 镜像
   -r  Self-hosted Runner 注册的目标仓库 (默认 ai-chat-demo-app, 也可用环境变量 RUNNER_REPO)
   -d  HTTPS 域名 (默认 api.aide.rlagnl.top, 也可用环境变量 SERVER_NAME)
+  -k  阿里云 AccessKey ID (DNS-01 签发证书, 需 AliyunDNSFullAccess 权限, 也可用环境变量 ALIYUN_ACCESS_KEY_ID)
+  -s  阿里云 AccessKey Secret (也可用环境变量 ALIYUN_ACCESS_KEY_SECRET)
   -h  显示帮助
 EOF
     exit 1
 }
 
-while getopts "u:t:r:d:h" opt; do
+while getopts "u:t:r:d:k:s:h" opt; do
     case "$opt" in
         u) GITHUB_USER="$OPTARG" ;;
         t) GITHUB_PAT="$OPTARG" ;;
         r) RUNNER_REPO="$OPTARG" ;;
         d) SERVER_NAME="$OPTARG" ;;
+        k) ALIYUN_ACCESS_KEY_ID="$OPTARG" ;;
+        s) ALIYUN_ACCESS_KEY_SECRET="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -221,6 +232,29 @@ step_0_collect_credentials() {
         echo "已通过参数/环境变量获取 GitHub Token (隐藏显示)"
     fi
     echo "Self-hosted Runner 将注册到: ${GITHUB_USER}/${RUNNER_REPO}"
+
+    # 收集阿里云 RAM AccessKey(DNS-01 签发证书需要, 仅当启用 HTTPS 时)
+    if [[ "${ENABLE_HTTPS:-1}" == "1" ]]; then
+        if [[ -z "$ALIYUN_ACCESS_KEY_ID" ]]; then
+            while true; do
+                ALIYUN_ACCESS_KEY_ID="$(prompt_input "请输入阿里云 AccessKey ID (需 AliyunDNSFullAccess 权限):")"
+                [[ -n "$ALIYUN_ACCESS_KEY_ID" ]] && break
+                echo "AccessKey ID 不能为空, 请重新输入"
+            done
+        else
+            echo "已通过参数/环境变量获取阿里云 AccessKey ID: $ALIYUN_ACCESS_KEY_ID"
+        fi
+
+        if [[ -z "$ALIYUN_ACCESS_KEY_SECRET" ]]; then
+            while true; do
+                ALIYUN_ACCESS_KEY_SECRET="$(prompt_password "请输入阿里云 AccessKey Secret:")"
+                [[ -n "$ALIYUN_ACCESS_KEY_SECRET" ]] && break
+                echo "AccessKey Secret 不能为空, 请重新输入"
+            done
+        else
+            echo "已通过参数/环境变量获取阿里云 AccessKey Secret (隐藏显示)"
+        fi
+    fi
 }
 
 # ============ 1. 安装 Docker ============
@@ -411,7 +445,7 @@ server {
     }
 }
 NGINX
-    # 将站点配置中的 __DOMAIN__ 占位符替换为实际域名(certbot --nginx 需按 server_name 匹配)
+    # 将站点配置中的 __DOMAIN__ 占位符替换为实际域名
     sed -i "s/__DOMAIN__/${SERVER_NAME}/g" /etc/nginx/sites-available/langgraph-server
 
     # 移除 nginx 默认站点(遵循工作区规则: 避免 80 端口显示 "Welcome to nginx")
@@ -438,10 +472,10 @@ NGINX
 LOGROTATE
 }
 
-# ============ 5. 配置 HTTPS (Let's Encrypt HTTP-01) ============
-# 用 certbot certonly --nginx(HTTP-01)只签发证书, 再手动写 80/443 配置
-# 不用 certbot --nginx 自动改写: 服务器上已存在其它站点(如 aui-components-mcp-server 的 mcp.aui.rlagnl.top),
-#   自动改写会因多站点/复杂 server 块导致本项目的 443 server 块缺失, 使请求落到其它站点的 default server
+# ============ 5. 配置 HTTPS (Let's Encrypt DNS-01) ============
+# 使用 DNS-01 验证(阿里云 DNS), 绕开 80 端口的 HTTP-01 验证
+# 原因: HTTP-01 依赖 80 端口与 certbot --nginx 对 nginx 配置的注入, 在本项目自定义配置下不可靠;
+#       统一改用 DNS-01(TXT 记录)验证, 不依赖 nginx 配置与 80 端口, 证书照常签发
 step_5_setup_https() {
     # 可通过 ENABLE_HTTPS=0 显式关闭(例如域名尚未解析到本机时)
     if [[ "${ENABLE_HTTPS:-1}" != "1" ]]; then
@@ -449,27 +483,49 @@ step_5_setup_https() {
         return 0
     fi
 
-    # 安装 certbot 及其 nginx 插件(certonly --nginx 需要 nginx 插件)
+    # 幂等: 证书已签发则跳过, 仅尝试续期
+    if [[ -d "/etc/letsencrypt/live/${SERVER_NAME}" ]]; then
+        echo "证书已存在: /etc/letsencrypt/live/${SERVER_NAME}, 跳过签发"
+        certbot renew --quiet || true
+        systemctl reload nginx || true
+        return 0
+    fi
+
+    # 安装 certbot 本体(apt 源)
     if ! command -v certbot >/dev/null 2>&1; then
         apt-get update -qq
-        apt-get install -y -qq certbot python3-certbot-nginx
+        apt-get install -y -qq certbot
     fi
 
-    # 签发证书(幂等): 已存在则只续期, 不重复签发
-    if [[ -d "/etc/letsencrypt/live/${SERVER_NAME}" ]]; then
-        echo "证书已存在: /etc/letsencrypt/live/${SERVER_NAME}, 跳过签发, 仅续期"
-        certbot renew --quiet || true
-    else
-        echo "通过 HTTP-01 验证签发证书(仅签发, 不自动改写 nginx)..."
-        # certonly --nginx: HTTP-01 验证, 只签发证书, 不改写 nginx 配置
-        certbot certonly --nginx -d "$SERVER_NAME" \
-            --non-interactive --agree-tos \
-            -m "$CERTBOT_EMAIL" \
-            --keep-until-expiring
+    # 安装 certbot-dns-aliyun 第三方插件(阿里云 DNS 验证, 官方未内置)
+    # 先确保 pip3 存在; 插件通过 pip 安装, 用阿里云 PyPI 镜像加速
+    if ! python3 -c "import certbot_dns_aliyun" >/dev/null 2>&1; then
+        command -v pip3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq python3-pip; }
+        # Ubuntu 24.04(PEP 668)禁止 pip 装到系统环境, 需 --break-system-packages; 旧版无此参数则走普通安装
+        pip3 install -i https://mirrors.aliyun.com/pypi/simple/ certbot-dns-aliyun \
+            || pip3 install --break-system-packages -i https://mirrors.aliyun.com/pypi/simple/ certbot-dns-aliyun
     fi
 
-    # 无论证书是否已存在, 都重写 nginx 配置(幂等): 保证 443 server 块始终正确
-    # 证书已存在但 nginx 配置被改乱时(如之前 certbot --nginx 残留), 重跑也能修复
+    # 写阿里云 RAM 凭证文件(供 dns-aliyun 插件调用 API 添加 TXT 记录)
+    mkdir -p /etc/letsencrypt
+    cat > /etc/letsencrypt/aliyun-credentials.ini <<EOF
+dns_aliyun_access_key = ${ALIYUN_ACCESS_KEY_ID}
+dns_aliyun_access_key_secret = ${ALIYUN_ACCESS_KEY_SECRET}
+EOF
+    chmod 600 /etc/letsencrypt/aliyun-credentials.ini
+
+    echo "通过 DNS-01 验证签发证书(阿里云 DNS, 不依赖 80 端口)..."
+    # --deploy-hook: 签发/续期成功后自动 reload nginx, 后续自动续期无需手动干预
+    certbot certonly \
+        --authenticator dns-aliyun \
+        --dns-aliyun-credentials /etc/letsencrypt/aliyun-credentials.ini \
+        -d "$SERVER_NAME" \
+        --non-interactive --agree-tos \
+        -m "$CERTBOT_EMAIL" \
+        --keep-until-expiring \
+        --deploy-hook "systemctl reload nginx"
+
+    # 证书签出后重新生成站点配置: 80 端口 301 跳转 HTTPS, 443 端口 SSL 终结 + 完整反向代理
     # 'NGINX' 加引号: $host 等 nginx 变量不被 shell 展开; __DOMAIN__ 由 sed 替换
     tee /etc/nginx/sites-available/langgraph-server > /dev/null <<'NGINX'
 # HTTP → HTTPS 跳转
@@ -513,9 +569,6 @@ server {
 }
 NGINX
     sed -i "s/__DOMAIN__/${SERVER_NAME}/g" /etc/nginx/sites-available/langgraph-server
-
-    # 确保软链接存在(幂等): 即使软链接丢失或 step_4 未执行, 重跑本步骤也能让配置生效
-    ln -sf /etc/nginx/sites-available/langgraph-server /etc/nginx/sites-enabled/langgraph-server
 
     nginx -t
     systemctl reload nginx
