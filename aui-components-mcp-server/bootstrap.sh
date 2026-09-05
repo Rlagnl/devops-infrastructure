@@ -423,6 +423,9 @@ server {
 NGINX
     sed -i "s/__DOMAIN__/${SERVER_NAME}/g" /etc/nginx/sites-available/aui-components-mcp-server
 
+    # 确保软链接存在(幂等): 即使软链接丢失或 step_4 未执行, 重跑本步骤也能让配置生效
+    ln -sf /etc/nginx/sites-available/aui-components-mcp-server /etc/nginx/sites-enabled/aui-components-mcp-server
+
     nginx -t
     systemctl reload nginx
 }
